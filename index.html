@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Agenda do Salão</title>
+<!-- Firebase (Firestore) — SDK compatível, sem precisar de build tools -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,600;0,700;1,600&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&family=Playfair+Display:ital,wght@0,600;0,700;1,600&family=Poppins:wght@400;500;600;700&family=Space+Mono:wght@400;700&family=Cormorant+Garamond:ital,wght@0,600;0,700;1,600&family=Work+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&family=Bodoni+Moda:ital,wght@0,600;0,700;1,600&family=Manrope:wght@400;500;600;700&family=Roboto+Mono:wght@500;600&family=Spectral:ital,wght@0,600;0,700;1,600&family=Nunito+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
 
@@ -170,6 +173,29 @@ const DOW_FULL = ['Domingo','Segunda-feira','Terça-feira','Quarta-feira','Quint
 const DOW_SHORT = ['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];
 const MONTHS = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
 
+// ======= CONFIGURAÇÃO DO FIREBASE =======
+// Pegue esses valores em: console.firebase.google.com > seu projeto > ⚙️ Configurações do projeto
+// > "Seus apps" > app Web (</>) > SDK setup and configuration.
+// Enquanto estiver com "COLE_AQUI", o app usa automaticamente um armazenamento local de reserva.
+const firebaseConfig = {
+  apiKey: "AIzaSyCAzYQ233tjzA6MabAzXf6BWU-pJceigbU",
+  authDomain: "salao-agenda-23f2e.firebaseapp.com",
+  projectId: "salao-agenda-23f2e",
+  storageBucket: "salao-agenda-23f2e.firebasestorage.app",
+  messagingSenderId: "794741392940",
+  appId: "1:794741392940:web:b7a18febde54734ebe7389"
+};
+
+let db = null;
+let useFirestore = false;
+try{
+  if(firebaseConfig.apiKey && firebaseConfig.apiKey !== 'COLE_AQUI' && typeof firebase !== 'undefined'){
+    firebase.initializeApp(firebaseConfig);
+    db = firebase.firestore();
+    useFirestore = true;
+  }
+}catch(e){ useFirestore = false; }
+
 const DEFAULT_CONFIG = {
   salonName: 'Studio Bella',
   workingDays: [1,2,3,4,5,6],
@@ -280,10 +306,69 @@ async function storageSet(key, value, shared){
   }catch(e){ return null; }
 }
 
+// ---- Config: um único documento ----
+async function loadConfigFromStore(){
+  if(useFirestore){
+    try{
+      const snap = await db.collection('agendaSalao').doc('config').get();
+      return snap.exists ? snap.data().payload : null;
+    }catch(e){ return null; }
+  }
+  const c = await storageGet('config', true);
+  return c ? JSON.parse(c.value) : null;
+}
+
+async function persistConfig(){
+  if(useFirestore){
+    try{ await db.collection('agendaSalao').doc('config').set({ payload: config }); return true; }
+    catch(e){ return false; }
+  }
+  try{ const r = await storageSet('config', JSON.stringify(config), true); return !!r; }
+  catch(e){ return false; }
+}
+
+// ---- Agendamentos: um registro (documento) por agendamento ----
+async function loadAppointmentsFromStore(){
+  if(useFirestore){
+    try{
+      const snap = await db.collection('appointments').get();
+      return snap.docs.map(d => d.data());
+    }catch(e){ return []; }
+  }
+  const a = await storageGet('appointments', true);
+  return a ? JSON.parse(a.value) : [];
+}
+
+async function persistAllAppointmentsFallback(){
+  try{ const r = await storageSet('appointments', JSON.stringify(appointments), true); return !!r; }
+  catch(e){ return false; }
+}
+
+async function addAppointmentRecord(appt){
+  if(useFirestore){
+    try{ await db.collection('appointments').doc(appt.id).set(appt); return true; }
+    catch(e){ return false; }
+  }
+  return await persistAllAppointmentsFallback();
+}
+async function updateAppointmentRecord(appt){
+  if(useFirestore){
+    try{ await db.collection('appointments').doc(appt.id).set(appt); return true; }
+    catch(e){ return false; }
+  }
+  return await persistAllAppointmentsFallback();
+}
+async function deleteAppointmentRecord(id){
+  if(useFirestore){
+    try{ await db.collection('appointments').doc(id).delete(); return true; }
+    catch(e){ return false; }
+  }
+  return await persistAllAppointmentsFallback();
+}
+
 async function loadData(){
   try{
-    const c = await storageGet('config', true);
-    config = c ? JSON.parse(c.value) : null;
+    config = await loadConfigFromStore();
   }catch(e){ config = null; }
   if(!config) config = {...DEFAULT_CONFIG};
   let dirty = !config;
@@ -302,8 +387,7 @@ async function loadData(){
   applyTheme();
 
   try{
-    const a = await storageGet('appointments', true);
-    appointments = a ? JSON.parse(a.value) : [];
+    appointments = await loadAppointmentsFromStore();
   }catch(e){ appointments = []; }
   checkEntryRoute();
   render();
@@ -318,13 +402,9 @@ function checkEntryRoute(){
 window.addEventListener('hashchange', () => { checkEntryRoute(); render(); });
 
 async function saveConfig(silent){
-  try{ await storageSet('config', JSON.stringify(config), true); }
-  catch(e){ flashMsg = 'Não foi possível salvar agora. Tente de novo.'; flashOk = false; }
+  const ok = await persistConfig();
+  if(!ok){ flashMsg = 'Não foi possível salvar agora. Tente de novo.'; flashOk = false; }
   if(!silent) render();
-}
-async function saveAppointments(){
-  try{ await storageSet('appointments', JSON.stringify(appointments), true); }
-  catch(e){ flashMsg = 'Não foi possível salvar o agendamento agora. Tente de novo.'; flashOk = false; }
 }
 
 function isLunchMinute(min){
@@ -556,7 +636,7 @@ async function confirmBooking(){
     createdAt: new Date().toISOString()
   };
   appointments.push(appt);
-  await saveAppointments();
+  await addAppointmentRecord(appt);
   showStamp(appt);
 }
 
@@ -611,7 +691,7 @@ function lookupBookings(){
   box.innerHTML = html;
 }
 
-async function cancelOwnBooking(id){ appointments = appointments.filter(a => a.id !== id); await saveAppointments(); lookupBookings(); }
+async function cancelOwnBooking(id){ appointments = appointments.filter(a => a.id !== id); await deleteAppointmentRecord(id); lookupBookings(); }
 
 function goAdmin(){ view = adminUnlocked ? 'admin' : 'admin-lock'; render(); }
 
@@ -833,7 +913,7 @@ function renderAdminAgenda(){
   return html;
 }
 
-async function adminCancel(id){ appointments = appointments.filter(a => a.id !== id); await saveAppointments(); render(); }
+async function adminCancel(id){ appointments = appointments.filter(a => a.id !== id); await deleteAppointmentRecord(id); render(); }
 
 function startEditAppointment(id){
   const a = appointments.find(x => x.id === id);
@@ -891,7 +971,7 @@ async function saveEditAppointment(){
   a.clientPhone = document.getElementById('editPhone').value.trim() || a.clientPhone;
   a.date = adminEditDate;
   a.time = adminEditTime;
-  await saveAppointments();
+  await updateAppointmentRecord(a);
   adminEditingId = null;
   flashMsg = 'Agendamento atualizado.'; flashOk = true;
   render();
