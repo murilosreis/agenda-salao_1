@@ -61,6 +61,9 @@ body{
 .cal-cell.past{ color:var(--line); cursor:not-allowed; background:none; }
 .cal-cell.closed{ color:var(--ink-soft); text-decoration:line-through; cursor:not-allowed; background:none; }
 .cal-cell.open:hover{ border-color:var(--wine); }
+.cal-cell.full{ background:var(--slot-booked); cursor:not-allowed; color:var(--ink-soft); }
+.cal-cell.full:hover{ border-color:transparent; }
+.full-label{ font-size:6.5px; font-family:var(--font-mono),monospace; text-transform:uppercase; letter-spacing:0.02em; color:var(--wine); margin-top:1px; }
 .cal-cell.selected{ background:var(--wine); color:#fff; }
 .cal-cell.today:not(.selected){ box-shadow: inset 0 0 0 1px var(--gold); font-weight:600; }
 
@@ -72,12 +75,14 @@ body{
 .service-card .sprice{ font-family:var(--font-mono),monospace; font-weight:600; color:var(--wine); font-size:14px; white-space:nowrap; padding-left:10px;}
 
 .slots-grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:14px; }
-.slot{ font-family:var(--font-mono),monospace; font-size:13px; font-weight:500; padding:10px 4px; text-align:center; border-radius:6px; border:1px solid var(--line); background:var(--slot-bg); cursor:pointer; }
+.slot{ font-family:var(--font-mono),monospace; font-size:13px; font-weight:500; padding:10px 4px; text-align:center; border-radius:6px; border:1px solid var(--line); background:var(--slot-bg); cursor:pointer; position:relative; }
 .slot:hover{ border-color:var(--wine); }
 .slot.booked{ background:var(--slot-booked); color:var(--ink-soft); text-decoration:line-through; cursor:not-allowed; }
 .slot.blocked{ background:transparent; border-style:dashed; color:var(--ink-soft); cursor:not-allowed; }
 .slot.selected{ background:var(--wine); border-color:var(--wine); color:#fff; }
 .slot.admin-toggle:hover{ border-color:var(--gold); }
+.slot-tip{ display:none; position:absolute; bottom:115%; left:50%; transform:translateX(-50%); background:var(--ink); color:#fff; padding:8px 10px; border-radius:8px; font-size:11px; line-height:1.5; white-space:nowrap; z-index:80; box-shadow:0 4px 14px rgba(0,0,0,0.3); text-decoration:none; text-align:left; }
+.slot.has-tip:hover .slot-tip{ display:block; }
 
 .empty-note{ font-size:13px; color:var(--ink-soft); text-align:center; padding:20px 0; }
 
@@ -165,7 +170,10 @@ button.link-btn{ background:none; border:none; color:var(--wine); font-size:13px
 .lunch-fields{ margin-top:8px; }
 
 .toast-stack{ position:fixed; top:14px; left:0; right:0; z-index:999; display:flex; flex-direction:column; align-items:center; gap:8px; pointer-events:none; }
-.toast{ background:var(--wine); color:#fff; border-radius:10px; padding:12px 16px; max-width:320px; width:90%; box-shadow:0 6px 20px rgba(0,0,0,0.25); animation:toastIn 0.25s ease-out; }
+.toast{ position:relative; background:var(--wine); color:#fff; border-radius:10px; padding:12px 34px 12px 16px; max-width:320px; width:90%; box-shadow:0 6px 20px rgba(0,0,0,0.25); animation:toastIn 0.25s ease-out; pointer-events:auto; }
+.toast-cancel{ background:#8C2F2F; }
+.toast-close{ position:absolute; top:6px; right:8px; background:none; border:none; color:#fff; font-size:17px; line-height:1; cursor:pointer; opacity:0.85; padding:2px 4px; }
+.toast-close:hover{ opacity:1; }
 .toast-title{ font-family:var(--font-mono),monospace; font-size:12px; font-weight:600; letter-spacing:0.03em; opacity:0.9; margin-bottom:4px; }
 .toast-body{ font-size:13px; line-height:1.4; }
 @keyframes toastIn{ from{ opacity:0; transform:translateY(-10px); } to{ opacity:1; transform:translateY(0); } }
@@ -275,6 +283,7 @@ let currentAdminUser = null;
 let notifications = [];
 let realtimeUnsub = null;
 let firstSnapshotDone = false;
+const localPendingDeletes = new Set();
 const ADMIN_SESSION_KEY = 'agenda_salao_admin_session';
 let adminTab = 'dashboard';
 let adminMonthOffset = 0;
@@ -450,6 +459,11 @@ function startRealtimeSync(){
         if(idx >= 0) appointments[idx] = data; else appointments.push(data);
       } else if(change.type === 'removed'){
         appointments = appointments.filter(a => a.id !== data.id);
+        if(localPendingDeletes.has(data.id)){
+          localPendingDeletes.delete(data.id);
+        } else if(firstSnapshotDone && adminUnlocked){
+          notifyCancelledAppointment(data);
+        }
       }
     });
     firstSnapshotDone = true;
@@ -500,6 +514,13 @@ function isDayOpen(iso){
   return true;
 }
 
+function isDayFull(iso){
+  if(!isDayOpen(iso)) return false;
+  const slots = generateSlots();
+  if(slots.length === 0) return false;
+  return slots.every(t => slotStatus(iso, t) !== 'available');
+}
+
 function slotStatus(iso, time, excludeId){
   const blocked = config.blockedSlots[iso] || [];
   if(blocked.includes(time)) return 'blocked';
@@ -546,12 +567,23 @@ function renderCalendar(opts){
       const isToday = iso === today;
       let cls = 'cal-cell';
       let click = '';
+      let inner = `${d.getDate()}`;
       if(isPast){ cls += ' past'; }
       else if(closed && !opts.allowClosed){ cls += ' closed'; }
-      else{ cls += ' open'; click = `onclick="${opts.clickFn}('${iso}')"`; }
+      else{
+        const full = isDayFull(iso);
+        if(full){
+          cls += ' open full';
+          inner = `<div style="display:flex;flex-direction:column;align-items:center;line-height:1.15;"><span>${d.getDate()}</span><span class="full-label">Lotado</span></div>`;
+          if(opts.allowClosed) click = `onclick="${opts.clickFn}('${iso}')"`;
+        } else {
+          cls += ' open';
+          click = `onclick="${opts.clickFn}('${iso}')"`;
+        }
+      }
       if(selected) cls += ' selected';
       if(isToday) cls += ' today';
-      html += `<div class="${cls}" ${click}>${d.getDate()}</div>`;
+      html += `<div class="${cls}" ${click}>${inner}</div>`;
     });
   });
   html += '</div>';
@@ -757,20 +789,52 @@ function lookupBookings(){
 
 async function cancelOwnBooking(id){ appointments = appointments.filter(a => a.id !== id); await deleteAppointmentRecord(id); lookupBookings(); }
 
+function playNotifySound(){
+  try{
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'sine';
+    o.frequency.value = 880;
+    g.gain.value = 0.0001;
+    o.connect(g); g.connect(ctx.destination);
+    const now = ctx.currentTime;
+    g.gain.exponentialRampToValueAtTime(0.22, now+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, now+0.4);
+    o.start(now);
+    o.stop(now+0.42);
+  }catch(e){ /* áudio bloqueado pelo navegador, ignora */ }
+}
+
 function notifyNewAppointment(appt){
   const id = 'n'+Date.now()+Math.random().toString(36).slice(2);
-  notifications.push({ id, name: appt.clientName, date: appt.date, time: appt.time, service: appt.serviceName });
+  notifications.push({ id, type:'new', name: appt.clientName, date: appt.date, time: appt.time, service: appt.serviceName });
+  playNotifySound();
   render();
-  setTimeout(() => { notifications = notifications.filter(n => n.id !== id); render(); }, 8000);
+}
+
+function notifyCancelledAppointment(appt){
+  const id = 'n'+Date.now()+Math.random().toString(36).slice(2);
+  notifications.push({ id, type:'cancel', name: appt.clientName, date: appt.date, time: appt.time, service: appt.serviceName });
+  playNotifySound();
+  render();
+}
+
+function dismissNotification(id){
+  notifications = notifications.filter(n => n.id !== id);
+  render();
 }
 
 function renderNotifications(){
   if(notifications.length === 0) return '';
-  return '<div class="toast-stack">' + notifications.map(n => `
-    <div class="toast">
-      <div class="toast-title">🔔 Novo agendamento</div>
+  return '<div class="toast-stack">' + notifications.map(n => {
+    const isCancel = n.type === 'cancel';
+    return `<div class="toast ${isCancel?'toast-cancel':''}">
+      <button class="toast-close" onclick="dismissNotification('${n.id}')">×</button>
+      <div class="toast-title">${isCancel ? '⚠️ Agendamento cancelado' : '🔔 Novo agendamento'}</div>
       <div class="toast-body"><strong>${escapeHtml(n.name)}</strong><br>${displayDate(n.date)} às ${n.time} · ${escapeHtml(n.service||'')}</div>
-    </div>`).join('') + '</div>';
+    </div>`;
+  }).join('') + '</div>';
 }
 
 function goAdmin(){ view = adminUnlocked ? 'admin' : 'admin-lock'; render(); }
@@ -997,7 +1061,7 @@ function renderAdminAgenda(){
   return html;
 }
 
-async function adminCancel(id){ appointments = appointments.filter(a => a.id !== id); await deleteAppointmentRecord(id); render(); }
+async function adminCancel(id){ localPendingDeletes.add(id); appointments = appointments.filter(a => a.id !== id); await deleteAppointmentRecord(id); render(); }
 
 function startEditAppointment(id){
   const a = appointments.find(x => x.id === id);
@@ -1081,10 +1145,17 @@ function renderAdminHorarios(){
     slots.forEach(t => {
       const st = slotStatus(adminSelectedDate, t);
       const cls = st === 'booked' ? 'booked' : (st === 'blocked' ? 'blocked' : 'admin-toggle');
-      const action = st === 'booked' ? '' : `onclick="toggleBlock('${adminSelectedDate}','${t}')"`;
-      html += `<div class="slot ${cls}" ${action}>${t}</div>`;
+      if(st === 'booked'){
+        const appt = appointments.find(a => a.date === adminSelectedDate && a.time === t);
+        const tip = appt
+          ? `<div class="slot-tip"><strong>${escapeHtml(appt.clientName)}</strong><br>${escapeHtml(maskPhone(appt.clientPhone))}<br>${escapeHtml(appt.serviceName||'')}</div>`
+          : '';
+        html += `<div class="slot ${cls} has-tip">${t}${tip}</div>`;
+      } else {
+        html += `<div class="slot ${cls}" onclick="toggleBlock('${adminSelectedDate}','${t}')">${t}</div>`;
+      }
     });
-    html += '</div><p class="footer-note">Toque em um horário livre para bloqueá-lo. Horários com cliente: cancele ou edite na aba Agenda.</p>';
+    html += '</div><p class="footer-note">Toque em um horário livre para bloqueá-lo. Passe o mouse sobre um horário ocupado para ver o agendamento.</p>';
   } else {
     html += `<p class="empty-note">Este dia está fechado ${isFullyBlocked ? '(bloqueado manualmente).' : '(fora dos dias de funcionamento).'}</p>`;
   }
@@ -1217,15 +1288,11 @@ async function removeUser(id){
 
 function renderTeamAccessCard(){
   const teamUrl = location.origin + location.pathname + '#equipe';
-  const qrSrc = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(teamUrl);
   return `<div class="card">
     <p class="section-label">Acesso da equipe</p>
     <p class="footer-note" style="text-align:left; margin:0 0 8px;">Link direto para a área da equipe (PIN necessário):</p>
     <input type="text" readonly value="${escapeHtml(teamUrl)}" onclick="this.select()" style="font-family:var(--font-mono),monospace; font-size:12px;">
-    <div style="text-align:center; margin-top:14px;">
-      <img src="${qrSrc}" alt="QR Code de acesso da equipe" style="border-radius:8px; border:1px solid var(--line); max-width:100%;">
-    </div>
-    <p class="footer-note" style="margin-top:10px;">Escaneie o QR Code no celular da equipe, ou abra o link e use "Adicionar à tela de início" (Safari) / "Instalar app" (Chrome) para criar um atalho.</p>
+    <p class="footer-note" style="margin-top:10px;">Abra o link no celular da equipe e use "Adicionar à tela de início" (Safari) / "Instalar app" (Chrome) para criar um atalho.</p>
     <p class="footer-note">Este link só funciona corretamente depois que o site estiver hospedado em um endereço público (ex: Firebase Hosting).</p>
   </div>`;
 }
