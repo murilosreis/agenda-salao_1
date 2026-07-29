@@ -163,6 +163,12 @@ button.link-btn{ background:none; border:none; color:var(--wine); font-size:13px
 
 .chart-wrap{ display:flex; justify-content:center; margin-top:12px; }
 .lunch-fields{ margin-top:8px; }
+
+.toast-stack{ position:fixed; top:14px; left:0; right:0; z-index:999; display:flex; flex-direction:column; align-items:center; gap:8px; pointer-events:none; }
+.toast{ background:var(--wine); color:#fff; border-radius:10px; padding:12px 16px; max-width:320px; width:90%; box-shadow:0 6px 20px rgba(0,0,0,0.25); animation:toastIn 0.25s ease-out; }
+.toast-title{ font-family:var(--font-mono),monospace; font-size:12px; font-weight:600; letter-spacing:0.03em; opacity:0.9; margin-bottom:4px; }
+.toast-body{ font-size:13px; line-height:1.4; }
+@keyframes toastIn{ from{ opacity:0; transform:translateY(-10px); } to{ opacity:1; transform:translateY(0); } }
 </style>
 </head>
 <body>
@@ -215,7 +221,8 @@ const DEFAULT_CONFIG = {
   lunchBreak: { enabled:false, start:'12:00', end:'13:00' },
   logoUrl: '',
   fontSet: 'classic',
-  colorPalette: 'vinho'
+  colorPalette: 'vinho',
+  backup: { enabled:false, time:'02:00', frequency:'daily', lastRunAt:null }
 };
 
 const FONT_SETS = {
@@ -244,6 +251,16 @@ function applyTheme(){
   root.setProperty('--font-mono', "'"+fs.mono+"'");
 }
 
+function maskPhone(value){
+  const d = (value||'').replace(/\D/g,'').slice(0,11);
+  if(d.length === 0) return '';
+  if(d.length <= 2) return '('+d;
+  if(d.length <= 6) return '('+d.slice(0,2)+') '+d.slice(2);
+  if(d.length <= 10) return '('+d.slice(0,2)+') '+d.slice(2,6)+'-'+d.slice(6);
+  return '('+d.slice(0,2)+') '+d.slice(2,7)+'-'+d.slice(7);
+}
+function onPhoneInput(el){ el.value = maskPhone(el.value); }
+
 let config = null;
 let appointments = [];
 let view = 'client';
@@ -255,6 +272,10 @@ let clientMonthOffset = 0;
 
 let adminUnlocked = false;
 let currentAdminUser = null;
+let notifications = [];
+let realtimeUnsub = null;
+let firstSnapshotDone = false;
+const ADMIN_SESSION_KEY = 'agenda_salao_admin_session';
 let adminTab = 'dashboard';
 let adminMonthOffset = 0;
 let adminSelectedDate = null;
@@ -383,14 +404,57 @@ async function loadData(){
   if(config.logoUrl === undefined){ config.logoUrl = ''; dirty = true; }
   if(!config.fontSet){ config.fontSet = 'classic'; dirty = true; }
   if(!config.colorPalette){ config.colorPalette = 'vinho'; dirty = true; }
+  if(!config.backup){ config.backup = {...DEFAULT_CONFIG.backup}; dirty = true; }
   if(dirty) await saveConfig(true);
   applyTheme();
 
-  try{
-    appointments = await loadAppointmentsFromStore();
-  }catch(e){ appointments = []; }
+  if(useFirestore){
+    appointments = [];
+    startRealtimeSync();
+  } else {
+    try{ appointments = await loadAppointmentsFromStore(); }catch(e){ appointments = []; }
+  }
+
+  restoreAdminSession();
   checkEntryRoute();
   render();
+}
+
+function restoreAdminSession(){
+  try{
+    const raw = localStorage.getItem(ADMIN_SESSION_KEY);
+    if(!raw) return;
+    const session = JSON.parse(raw);
+    const user = config.users.find(u => u.id === session.userId);
+    if(user){
+      adminUnlocked = true;
+      currentAdminUser = user;
+      checkAutoBackup();
+    } else {
+      localStorage.removeItem(ADMIN_SESSION_KEY);
+    }
+  }catch(e){ /* sessão inválida, ignora */ }
+}
+
+function startRealtimeSync(){
+  if(!useFirestore || realtimeUnsub) return;
+  realtimeUnsub = db.collection('appointments').onSnapshot(snapshot => {
+    snapshot.docChanges().forEach(change => {
+      const data = change.doc.data();
+      if(change.type === 'added'){
+        const idx = appointments.findIndex(a => a.id === data.id);
+        if(idx >= 0) appointments[idx] = data; else appointments.push(data);
+        if(firstSnapshotDone && adminUnlocked) notifyNewAppointment(data);
+      } else if(change.type === 'modified'){
+        const idx = appointments.findIndex(a => a.id === data.id);
+        if(idx >= 0) appointments[idx] = data; else appointments.push(data);
+      } else if(change.type === 'removed'){
+        appointments = appointments.filter(a => a.id !== data.id);
+      }
+    });
+    firstSnapshotDone = true;
+    render();
+  }, () => { /* erro de conexão: mantém os dados já carregados */ });
 }
 
 function checkEntryRoute(){
@@ -514,7 +578,7 @@ function render(){
   else if(view === 'admin-lock') html += renderAdminLock();
   else if(view === 'admin') html += renderAdmin();
 
-  app.innerHTML = html;
+  app.innerHTML = renderNotifications() + html;
   flashMsg = null;
 }
 
@@ -611,7 +675,7 @@ function renderBookingForm(){
       <label class="field">Seu nome</label>
       <input type="text" id="clientName" placeholder="Nome completo">
       <label class="field">WhatsApp / telefone</label>
-      <input type="tel" id="clientPhone" placeholder="(00) 00000-0000">
+      <input type="tel" id="clientPhone" placeholder="(00) 00000-0000" inputmode="numeric" oninput="onPhoneInput(this)">
       <button class="primary" onclick="confirmBooking()">Carimbar meu horário</button>
       <button class="secondary" onclick="selectedTime=null; render();">Voltar</button>
     </div>`;
@@ -665,7 +729,7 @@ function openMyBookings(){
     <div class="card">
       <p class="section-label">Buscar meu horário</p>
       <label class="field">Telefone usado no agendamento</label>
-      <input type="tel" id="lookupPhone" placeholder="(00) 00000-0000">
+      <input type="tel" id="lookupPhone" placeholder="(00) 00000-0000" inputmode="numeric" oninput="onPhoneInput(this)">
       <button class="primary" onclick="lookupBookings()">Buscar</button>
       <button class="secondary" onclick="resetClient()">Voltar</button>
       <div id="lookupResults"></div>
@@ -693,6 +757,22 @@ function lookupBookings(){
 
 async function cancelOwnBooking(id){ appointments = appointments.filter(a => a.id !== id); await deleteAppointmentRecord(id); lookupBookings(); }
 
+function notifyNewAppointment(appt){
+  const id = 'n'+Date.now()+Math.random().toString(36).slice(2);
+  notifications.push({ id, name: appt.clientName, date: appt.date, time: appt.time, service: appt.serviceName });
+  render();
+  setTimeout(() => { notifications = notifications.filter(n => n.id !== id); render(); }, 8000);
+}
+
+function renderNotifications(){
+  if(notifications.length === 0) return '';
+  return '<div class="toast-stack">' + notifications.map(n => `
+    <div class="toast">
+      <div class="toast-title">🔔 Novo agendamento</div>
+      <div class="toast-body"><strong>${escapeHtml(n.name)}</strong><br>${displayDate(n.date)} às ${n.time} · ${escapeHtml(n.service||'')}</div>
+    </div>`).join('') + '</div>';
+}
+
 function goAdmin(){ view = adminUnlocked ? 'admin' : 'admin-lock'; render(); }
 
 function renderAdminLock(){
@@ -708,7 +788,11 @@ function renderAdminLock(){
 function tryUnlock(){
   const val = document.getElementById('pinInput').value.trim();
   const user = config.users.find(u => u.pin === val);
-  if(user){ adminUnlocked = true; currentAdminUser = user; view = 'admin'; adminTab = 'dashboard'; }
+  if(user){
+    adminUnlocked = true; currentAdminUser = user; view = 'admin'; adminTab = 'dashboard';
+    try{ localStorage.setItem(ADMIN_SESSION_KEY, JSON.stringify({ userId: user.id })); }catch(e){}
+    checkAutoBackup();
+  }
   else{ flashMsg = 'PIN incorreto.'; flashOk=false; }
   render();
 }
@@ -716,7 +800,7 @@ function tryUnlock(){
 function renderAdmin(){
   let html = `<div class="card" style="padding:10px 14px; display:flex; justify-content:space-between; align-items:center;">
     <span style="font-size:13px;">Olá, <strong>${escapeHtml(currentAdminUser.name)}</strong></span>
-    <button class="link-btn" onclick="location.hash=''; adminUnlocked=false; currentAdminUser=null; resetClient();">Sair</button>
+    <button class="link-btn" onclick="location.hash=''; adminUnlocked=false; currentAdminUser=null; try{localStorage.removeItem(ADMIN_SESSION_KEY);}catch(e){} resetClient();">Sair</button>
   </div>`;
   html += `<div class="tabbar">
     <button class="${adminTab==='dashboard'?'active':''}" onclick="setAdminTab('dashboard')">Painel</button>
@@ -901,7 +985,7 @@ function renderAdminAgenda(){
       }
       html += `<div class="appt-row">
         <div class="time">${a.time}</div>
-        <div class="info"><div class="name">${escapeHtml(a.clientName)}</div><div class="phone">${escapeHtml(a.clientPhone)}</div><div class="svc">${escapeHtml(a.serviceName||'')}</div></div>
+        <div class="info"><div class="name">${escapeHtml(a.clientName)}</div><div class="phone">${escapeHtml(maskPhone(a.clientPhone))}</div><div class="svc">${escapeHtml(a.serviceName||'')}</div></div>
         <div class="actions">
           <button class="edit" onclick="startEditAppointment('${a.id}')">Editar</button>
           <button class="cancel" onclick="adminCancel('${a.id}')">Cancelar</button>
@@ -934,7 +1018,7 @@ function renderAdminEditAppointment(){
     <label class="field">Nome</label>
     <input type="text" id="editName" value="${escapeHtml(a.clientName)}">
     <label class="field">Telefone</label>
-    <input type="tel" id="editPhone" value="${escapeHtml(a.clientPhone)}">
+    <input type="tel" id="editPhone" value="${escapeHtml(maskPhone(a.clientPhone))}" inputmode="numeric" oninput="onPhoneInput(this)">
     <p class="section-label" style="margin-top:16px;">Nova data</p>
     ${renderCalendar({ monthOffset: adminEditMonthOffset, selected: adminEditDate, prevFn:'adminEditPrevMonth', nextFn:'adminEditNextMonth', clickFn:'pickEditDate', allowClosed:false })}`;
 
@@ -1131,6 +1215,21 @@ async function removeUser(id){
   await saveConfig();
 }
 
+function renderTeamAccessCard(){
+  const teamUrl = location.origin + location.pathname + '#equipe';
+  const qrSrc = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(teamUrl);
+  return `<div class="card">
+    <p class="section-label">Acesso da equipe</p>
+    <p class="footer-note" style="text-align:left; margin:0 0 8px;">Link direto para a área da equipe (PIN necessário):</p>
+    <input type="text" readonly value="${escapeHtml(teamUrl)}" onclick="this.select()" style="font-family:var(--font-mono),monospace; font-size:12px;">
+    <div style="text-align:center; margin-top:14px;">
+      <img src="${qrSrc}" alt="QR Code de acesso da equipe" style="border-radius:8px; border:1px solid var(--line); max-width:100%;">
+    </div>
+    <p class="footer-note" style="margin-top:10px;">Escaneie o QR Code no celular da equipe, ou abra o link e use "Adicionar à tela de início" (Safari) / "Instalar app" (Chrome) para criar um atalho.</p>
+    <p class="footer-note">Este link só funciona corretamente depois que o site estiver hospedado em um endereço público (ex: Firebase Hosting).</p>
+  </div>`;
+}
+
 function renderAdminConfig(){
   const dayLabels = ['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];
   let dayChecks = '<div class="check-row">';
@@ -1157,7 +1256,22 @@ function renderAdminConfig(){
 
   const logoPreview = config.logoUrl ? `<div class="logo-preview"><img src="${escapeHtml(config.logoUrl)}" onerror="this.parentElement.style.display='none'"></div>` : '';
 
-  return `<div class="card">
+  const backupOn = !!(config.backup && config.backup.enabled);
+  const backupFields = backupOn ? `<div class="row2 lunch-fields">
+        <div><label class="field">Horário preferido</label><input type="time" id="cfgBackupTime" value="${config.backup.time}"></div>
+        <div><label class="field">Frequência</label>
+          <select id="cfgBackupFreq">
+            <option value="daily" ${config.backup.frequency==='daily'?'selected':''}>Diária</option>
+            <option value="weekly" ${config.backup.frequency==='weekly'?'selected':''}>Semanal</option>
+          </select>
+        </div>
+      </div>` : '';
+  const lastBackupLabel = config.backup && config.backup.lastRunAt
+    ? new Date(config.backup.lastRunAt).toLocaleString('pt-BR')
+    : 'nunca';
+
+  return `${renderTeamAccessCard()}
+    <div class="card">
       <p class="section-label">Nome do salão</p>
       <input type="text" id="cfgName" value="${escapeHtml(config.salonName)}">
       <p class="section-label" style="margin-top:18px;">Dias de funcionamento</p>
@@ -1186,6 +1300,20 @@ function renderAdminConfig(){
       <div class="palette-row">${paletteSwatches}</div>
 
       <button class="primary" onclick="saveAdminConfig()">Salvar ajustes</button>
+    </div>
+
+    <div class="card">
+      <p class="section-label">Backup automático</p>
+      <div class="check-row"><div class="day-check ${backupOn?'on':''}" onclick="toggleBackup()">${backupOn?'Backup ativado':'Ativar backup automático'}</div></div>
+      ${backupFields}
+      <p class="footer-note" style="text-align:left; margin-top:8px;">
+        O backup automático salva uma cópia completa (agendamentos + configurações) na nuvem, dentro do próprio banco de dados, sempre que alguém da equipe abrir o painel após o horário previsto já ter passado — não depende de deixar o computador ligado. Último backup: <strong>${escapeHtml(lastBackupLabel)}</strong>.
+      </p>
+      <div class="btn-row">
+        <button class="secondary" style="flex:1;" onclick="runBackupNow(false)">Fazer backup agora</button>
+        <button class="secondary" style="flex:1;" onclick="downloadBackupFile()">Baixar cópia (.json)</button>
+      </div>
+      <p class="footer-note" style="text-align:left; margin-top:8px;">A cópia baixada em .json vai para a pasta de downloads padrão do navegador — os navegadores não permitem que um site escolha uma pasta do computador automaticamente.</p>
     </div>`;
 }
 
@@ -1198,6 +1326,12 @@ function toggleWorkDay(i){
 function toggleLunchBreak(){
   if(!config.lunchBreak) config.lunchBreak = {...DEFAULT_CONFIG.lunchBreak};
   config.lunchBreak.enabled = !config.lunchBreak.enabled;
+  render();
+}
+
+function toggleBackup(){
+  if(!config.backup) config.backup = {...DEFAULT_CONFIG.backup};
+  config.backup.enabled = !config.backup.enabled;
   render();
 }
 
@@ -1215,10 +1349,50 @@ async function saveAdminConfig(){
     if(ls) config.lunchBreak.start = ls.value || config.lunchBreak.start;
     if(le) config.lunchBreak.end = le.value || config.lunchBreak.end;
   }
+  if(config.backup && config.backup.enabled){
+    const bt = document.getElementById('cfgBackupTime');
+    const bf = document.getElementById('cfgBackupFreq');
+    if(bt) config.backup.time = bt.value || config.backup.time;
+    if(bf) config.backup.frequency = bf.value || config.backup.frequency;
+  }
   const logoInput = document.getElementById('cfgLogoUrl');
   config.logoUrl = logoInput ? logoInput.value.trim() : config.logoUrl;
   flashMsg = 'Ajustes salvos.'; flashOk = true;
   await saveConfig();
+}
+
+async function checkAutoBackup(){
+  if(!config || !config.backup || !config.backup.enabled) return;
+  const last = config.backup.lastRunAt ? new Date(config.backup.lastRunAt) : null;
+  const now = new Date();
+  const intervalMs = (config.backup.frequency === 'weekly' ? 7 : 1) * 24*60*60*1000;
+  if(!last || (now - last) >= intervalMs){
+    await runBackupNow(true);
+  }
+}
+
+async function runBackupNow(silent){
+  const snapshot = { generatedAt: new Date().toISOString(), config, appointments };
+  if(useFirestore){
+    try{
+      const key = todayISO()+'_'+Date.now();
+      await db.collection('backups').doc(key).set(snapshot);
+    }catch(e){ if(!silent){ flashMsg = 'Não foi possível fazer o backup agora.'; flashOk = false; render(); return; } }
+  }
+  if(!config.backup) config.backup = {...DEFAULT_CONFIG.backup};
+  config.backup.lastRunAt = new Date().toISOString();
+  await persistConfig();
+  if(!silent){ flashMsg = 'Backup realizado agora.'; flashOk = true; render(); }
+}
+
+function downloadBackupFile(){
+  const snapshot = { generatedAt: new Date().toISOString(), config, appointments };
+  const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type:'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'backup-agenda-'+todayISO()+'.json';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 loadData();
