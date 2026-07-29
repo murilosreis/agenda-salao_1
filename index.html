@@ -253,9 +253,36 @@ function todayISO(){ const d = new Date(); d.setHours(0,0,0,0); return toISODate
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function money(n){ return 'R$ ' + Number(n||0).toFixed(2).replace('.',','); }
 
+const STORAGE_PREFIX = 'agenda_salao_';
+const hasCloudStorage = (typeof window !== 'undefined') && window.storage && typeof window.storage.get === 'function';
+
+async function storageGet(key, shared){
+  if(hasCloudStorage){
+    try{ return await window.storage.get(key, shared); }
+    catch(e){ /* cai para o fallback local abaixo */ }
+  }
+  try{
+    const raw = localStorage.getItem(STORAGE_PREFIX+key);
+    return raw ? { key, value: raw, shared: !!shared } : null;
+  }catch(e){ return null; }
+}
+
+async function storageSet(key, value, shared){
+  if(hasCloudStorage){
+    try{
+      const res = await window.storage.set(key, value, shared);
+      if(res) return res;
+    }catch(e){ /* cai para o fallback local abaixo */ }
+  }
+  try{
+    localStorage.setItem(STORAGE_PREFIX+key, value);
+    return { key, value, shared: !!shared };
+  }catch(e){ return null; }
+}
+
 async function loadData(){
   try{
-    const c = await window.storage.get('config', true);
+    const c = await storageGet('config', true);
     config = c ? JSON.parse(c.value) : null;
   }catch(e){ config = null; }
   if(!config) config = {...DEFAULT_CONFIG};
@@ -275,7 +302,7 @@ async function loadData(){
   applyTheme();
 
   try{
-    const a = await window.storage.get('appointments', true);
+    const a = await storageGet('appointments', true);
     appointments = a ? JSON.parse(a.value) : [];
   }catch(e){ appointments = []; }
   checkEntryRoute();
@@ -291,12 +318,12 @@ function checkEntryRoute(){
 window.addEventListener('hashchange', () => { checkEntryRoute(); render(); });
 
 async function saveConfig(silent){
-  try{ await window.storage.set('config', JSON.stringify(config), true); }
+  try{ await storageSet('config', JSON.stringify(config), true); }
   catch(e){ flashMsg = 'Não foi possível salvar agora. Tente de novo.'; flashOk = false; }
   if(!silent) render();
 }
 async function saveAppointments(){
-  try{ await window.storage.set('appointments', JSON.stringify(appointments), true); }
+  try{ await storageSet('appointments', JSON.stringify(appointments), true); }
   catch(e){ flashMsg = 'Não foi possível salvar o agendamento agora. Tente de novo.'; flashOk = false; }
 }
 
