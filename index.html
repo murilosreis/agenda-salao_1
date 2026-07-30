@@ -81,6 +81,15 @@ body{
 .slot.blocked{ background:transparent; border-style:dashed; color:var(--ink-soft); cursor:not-allowed; }
 .slot.selected{ background:var(--wine); border-color:var(--wine); color:#fff; }
 .slot.admin-toggle:hover{ border-color:var(--gold); }
+.slot.grace{ border-color:var(--gold); border-style:solid; box-shadow:0 0 0 1px var(--gold) inset; }
+.slot-clock{ font-size:9px; margin-top:2px; color:var(--gold); letter-spacing:0.02em; }
+
+.modal-overlay{ position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; display:flex; align-items:center; justify-content:center; padding:20px; }
+.modal-box{ background:var(--paper); border-radius:12px; padding:20px; max-width:340px; width:100%; box-shadow:0 12px 40px rgba(0,0,0,0.3); }
+.modal-text{ font-size:14px; line-height:1.5; margin-bottom:16px; color:var(--ink); }
+
+.whatsapp-btn{ display:inline-block; background:#25D366; color:#fff; text-decoration:none; padding:11px 20px; border-radius:8px; font-weight:600; font-size:14px; font-family:var(--font-body),sans-serif; }
+.whatsapp-btn:hover{ opacity:0.92; }
 .slot-tip{ display:none; position:absolute; bottom:115%; left:50%; transform:translateX(-50%); background:var(--ink); color:#fff; padding:8px 10px; border-radius:8px; font-size:11px; line-height:1.5; white-space:nowrap; z-index:80; box-shadow:0 4px 14px rgba(0,0,0,0.3); text-decoration:none; text-align:left; }
 .slot.has-tip:hover .slot-tip{ display:block; }
 
@@ -172,6 +181,7 @@ button.link-btn{ background:none; border:none; color:var(--wine); font-size:13px
 .toast-stack{ position:fixed; top:14px; left:0; right:0; z-index:999; display:flex; flex-direction:column; align-items:center; gap:8px; pointer-events:none; }
 .toast{ position:relative; background:var(--wine); color:#fff; border-radius:10px; padding:12px 34px 12px 16px; max-width:320px; width:90%; box-shadow:0 6px 20px rgba(0,0,0,0.25); animation:toastIn 0.25s ease-out; pointer-events:auto; }
 .toast-cancel{ background:#8C2F2F; }
+.toast-new{ background:#2F6B4F; }
 .toast-close{ position:absolute; top:6px; right:8px; background:none; border:none; color:#fff; font-size:17px; line-height:1; cursor:pointer; opacity:0.85; padding:2px 4px; }
 .toast-close:hover{ opacity:1; }
 .toast-title{ font-family:var(--font-mono),monospace; font-size:12px; font-weight:600; letter-spacing:0.03em; opacity:0.9; margin-bottom:4px; }
@@ -230,7 +240,9 @@ const DEFAULT_CONFIG = {
   logoUrl: '',
   fontSet: 'classic',
   colorPalette: 'vinho',
-  backup: { enabled:false, time:'02:00', frequency:'daily', lastRunAt:null }
+  backup: { enabled:false, time:'02:00', frequency:'daily', lastRunAt:null },
+  slotTolerance: 15,
+  whatsappLink: ''
 };
 
 const FONT_SETS = {
@@ -277,6 +289,11 @@ let selectedServiceId = null;
 let selectedDate = null;
 let selectedTime = null;
 let clientMonthOffset = 0;
+let clientSubView = null;
+let clientLookupResults = null;
+let clientLookupPhone = '';
+let stampAppt = null;
+let pendingConfirm = null;
 
 let adminUnlocked = false;
 let currentAdminUser = null;
@@ -414,6 +431,8 @@ async function loadData(){
   if(!config.fontSet){ config.fontSet = 'classic'; dirty = true; }
   if(!config.colorPalette){ config.colorPalette = 'vinho'; dirty = true; }
   if(!config.backup){ config.backup = {...DEFAULT_CONFIG.backup}; dirty = true; }
+  if(config.slotTolerance === undefined || config.slotTolerance === null){ config.slotTolerance = 15; dirty = true; }
+  if(config.whatsappLink === undefined){ config.whatsappLink = ''; dirty = true; }
   if(dirty) await saveConfig(true);
   applyTheme();
 
@@ -514,11 +533,35 @@ function isDayOpen(iso){
   return true;
 }
 
+function getTolerance(){
+  const t = Number(config.slotTolerance);
+  return isNaN(t) || t < 0 ? 15 : t;
+}
+
+// Para horários de hoje: 'ok' (ainda não chegou a hora), 'grace' (passou da hora, mas dentro da tolerância)
+// ou 'expired' (tolerância esgotada, deve desativar).
+function computeSlotTiming(iso, time){
+  if(iso !== todayISO()) return { status:'ok' };
+  const [h,m] = time.split(':').map(Number);
+  const slotDate = new Date();
+  slotDate.setHours(h, m, 0, 0);
+  const tol = getTolerance();
+  const graceEnd = new Date(slotDate.getTime() + tol*60000);
+  const now = new Date();
+  if(now < slotDate) return { status:'ok' };
+  if(tol > 0 && now < graceEnd) return { status:'grace', msLeft: graceEnd - now };
+  return { status:'expired' };
+}
+
 function isDayFull(iso){
   if(!isDayOpen(iso)) return false;
   const slots = generateSlots();
   if(slots.length === 0) return false;
-  return slots.every(t => slotStatus(iso, t) !== 'available');
+  return slots.every(t => {
+    const timing = computeSlotTiming(iso, t);
+    if(timing.status === 'expired') return true;
+    return slotStatus(iso, t) !== 'available';
+  });
 }
 
 function slotStatus(iso, time, excludeId){
@@ -606,15 +649,19 @@ function render(){
     html += `<div class="card flash ${flashOk?'ok':''}">${escapeHtml(flashMsg)}</div>`;
   }
 
-  if(view === 'client') html += renderClient();
+  if(stampAppt){
+    html += renderStampScreen();
+  } else if(view === 'client') html += renderClient();
   else if(view === 'admin-lock') html += renderAdminLock();
   else if(view === 'admin') html += renderAdmin();
 
-  app.innerHTML = renderNotifications() + html;
+  app.innerHTML = renderNotifications() + renderConfirmModal() + html;
   flashMsg = null;
 }
 
 function renderClient(){
+  if(clientSubView === 'lookup') return renderLookupScreen();
+
   if(!config.services || config.services.length === 0){
     return '<div class="card"><p class="empty-note">Nenhum serviço cadastrado ainda. Peça para a equipe cadastrar os serviços na área administrativa.</p></div>';
   }
@@ -624,6 +671,11 @@ function renderClient(){
     let html = '<div class="card"><p class="section-label">Escolha o dia</p>';
     html += renderCalendar({ monthOffset: clientMonthOffset, selected: selectedDate, prevFn:'clientPrevMonth', nextFn:'clientNextMonth', clickFn:'pickDate' });
     html += '</div>';
+    if(config.whatsappLink){
+      html += `<div class="card" style="text-align:center;">
+        <a href="${escapeHtml(config.whatsappLink)}" target="_blank" rel="noopener" class="whatsapp-btn">💬 Dúvidas? Fale no WhatsApp</a>
+      </div>`;
+    }
     html += `<div class="card" style="text-align:center;">
       <button class="link-btn" onclick="openMyBookings()">Já tenho um horário marcado</button>
     </div>`;
@@ -649,6 +701,9 @@ function renderClient(){
       </div>`;
     });
     html += '</div></div>';
+    html += `<div class="card" style="text-align:center;">
+      <button class="secondary" onclick="selectedDate=null; render();">← Voltar</button>
+    </div>`;
     return html;
   }
 
@@ -665,13 +720,7 @@ function renderClient(){
 
   html += `<div class="card">`;
   const slots = generateSlots();
-  const isToday = selectedDate === todayISO();
-  const nowMin = new Date().getHours()*60+new Date().getMinutes();
-  const visible = slots.filter(t => {
-    if(!isToday) return true;
-    const [h,m] = t.split(':').map(Number);
-    return h*60+m > nowMin;
-  });
+  const visible = slots.filter(t => computeSlotTiming(selectedDate, t).status !== 'expired');
   html += `<p class="section-label">Horários de ${DOW_FULL[d.getDay()]}, ${displayDate(selectedDate)}</p>`;
   if(visible.length === 0){
     html += '<div class="empty-note">Não há mais horários livres nesse dia. Escolha outra data acima.</div>';
@@ -679,8 +728,17 @@ function renderClient(){
     html += '<div class="slots-grid">';
     visible.forEach(t => {
       const st = slotStatus(selectedDate, t);
-      if(st === 'available') html += `<div class="slot" onclick="pickSlot('${t}')">${t}</div>`;
-      else html += `<div class="slot ${st}">${t}</div>`;
+      const timing = computeSlotTiming(selectedDate, t);
+      if(st !== 'available'){
+        html += `<div class="slot ${st}">${t}</div>`;
+      } else if(timing.status === 'grace'){
+        const secs = Math.max(0, Math.floor(timing.msLeft/1000));
+        const mm = String(Math.floor(secs/60)).padStart(2,'0');
+        const ss = String(secs%60).padStart(2,'0');
+        html += `<div class="slot grace" onclick="pickSlot('${t}')">${t}<div class="slot-clock">${mm}:${ss}</div></div>`;
+      } else {
+        html += `<div class="slot" onclick="pickSlot('${t}')">${t}</div>`;
+      }
     });
     html += '</div>';
   }
@@ -688,6 +746,9 @@ function renderClient(){
 
   html += `<div class="card" style="text-align:center;">
     <button class="link-btn" onclick="openMyBookings()">Já tenho um horário marcado</button>
+  </div>`;
+  html += `<div class="card" style="text-align:center;">
+    <button class="secondary" onclick="selectedServiceId=null; selectedTime=null; render();">← Voltar</button>
   </div>`;
   return html;
 }
@@ -737,57 +798,101 @@ async function confirmBooking(){
 }
 
 function showStamp(appt){
-  const app = document.getElementById('app');
+  stampAppt = appt;
+  selectedServiceId = null; selectedDate = null; selectedTime = null; clientSubView = null;
+  render();
+}
+
+function renderStampScreen(){
+  const appt = stampAppt;
   const d = fromISODate(appt.date);
-  app.innerHTML = `<div class="masthead"><h1>${escapeHtml(config.salonName)}</h1></div>
-    <div class="card">
+  return `<div class="card">
       <div class="stamp-wrap">
         <div class="stamp"><span>AGENDADO</span></div>
         <p class="confirm-detail">${escapeHtml(appt.serviceName)}<br>${DOW_FULL[d.getDay()]}, ${displayDate(appt.date)}<br><span class="b">${appt.time}</span></p>
         <p style="font-size:13px; color:var(--ink-soft); margin-top:12px;">Guarde essa data, ${escapeHtml(appt.clientName.split(' ')[0])}! Para cancelar, volte e toque em "Já tenho um horário marcado".</p>
       </div>
       <div class="btn-row">
-        <button class="secondary" onclick="resetClient()" style="flex:1;">Fechar</button>
-        <button class="primary" onclick="resetClient()" style="flex:1; margin-top:0;">Novo agendamento</button>
+        <button class="secondary" onclick="stampAppt=null; resetClient();" style="flex:1;">Fechar</button>
+        <button class="primary" onclick="stampAppt=null; resetClient();" style="flex:1; margin-top:0;">Novo agendamento</button>
       </div>
     </div>`;
 }
 
-function resetClient(){ selectedServiceId=null; selectedDate=null; selectedTime=null; view='client'; render(); }
+function resetClient(){
+  selectedServiceId=null; selectedDate=null; selectedTime=null;
+  clientSubView=null; clientLookupResults=null; clientLookupPhone=''; stampAppt=null;
+  view='client'; render();
+}
 
-function openMyBookings(){
-  const app = document.getElementById('app');
-  app.innerHTML = `<div class="masthead"><h1>${escapeHtml(config.salonName)}</h1></div>
-    <div class="card">
+function openMyBookings(){ clientSubView = 'lookup'; clientLookupResults = null; render(); }
+
+function renderLookupScreen(){
+  let html = `<div class="card">
       <p class="section-label">Buscar meu horário</p>
       <label class="field">Telefone usado no agendamento</label>
-      <input type="tel" id="lookupPhone" placeholder="(00) 00000-0000" inputmode="numeric" oninput="onPhoneInput(this)">
+      <input type="tel" id="lookupPhone" placeholder="(00) 00000-0000" inputmode="numeric" oninput="onPhoneInput(this)" value="${escapeHtml(clientLookupPhone)}">
       <button class="primary" onclick="lookupBookings()">Buscar</button>
-      <button class="secondary" onclick="resetClient()">Voltar</button>
-      <div id="lookupResults"></div>
-    </div>`;
+      <button class="secondary" onclick="resetClient()">← Voltar</button>`;
+  if(clientLookupResults !== null){
+    if(clientLookupResults.length === 0){
+      html += '<p class="empty-note">Nenhum horário futuro encontrado com esse telefone.</p>';
+    } else {
+      html += '<div style="margin-top:14px;">';
+      clientLookupResults.forEach(a => {
+        const d = fromISODate(a.date);
+        html += `<div class="appt-row">
+          <div class="time">${a.time}</div>
+          <div class="info"><div class="name">${DOW_FULL[d.getDay()]}, ${displayDate(a.date)}</div><div class="svc">${escapeHtml(a.serviceName||'')}</div></div>
+          <div class="actions"><button class="cancel" onclick="requestCancelConfirm('client','${a.id}')">Cancelar</button></div>
+        </div>`;
+      });
+      html += '</div>';
+    }
+  }
+  html += '</div>';
+  return html;
 }
 
 function lookupBookings(){
-  const phone = document.getElementById('lookupPhone').value.trim();
-  const results = appointments.filter(a => a.clientPhone === phone && a.date >= todayISO());
-  const box = document.getElementById('lookupResults');
-  if(results.length === 0){ box.innerHTML = '<p class="empty-note">Nenhum horário futuro encontrado com esse telefone.</p>'; return; }
-  results.sort((a,b) => (a.date+a.time).localeCompare(b.date+b.time));
-  let html = '<div style="margin-top:14px;">';
-  results.forEach(a => {
-    const d = fromISODate(a.date);
-    html += `<div class="appt-row">
-      <div class="time">${a.time}</div>
-      <div class="info"><div class="name">${DOW_FULL[d.getDay()]}, ${displayDate(a.date)}</div><div class="svc">${escapeHtml(a.serviceName||'')}</div></div>
-      <div class="actions"><button class="cancel" onclick="cancelOwnBooking('${a.id}')">Cancelar</button></div>
-    </div>`;
-  });
-  html += '</div>';
-  box.innerHTML = html;
+  clientLookupPhone = document.getElementById('lookupPhone').value.trim();
+  clientLookupResults = appointments.filter(a => a.clientPhone === clientLookupPhone && a.date >= todayISO())
+    .sort((a,b) => (a.date+a.time).localeCompare(b.date+b.time));
+  render();
 }
 
-async function cancelOwnBooking(id){ appointments = appointments.filter(a => a.id !== id); await deleteAppointmentRecord(id); lookupBookings(); }
+async function cancelOwnBooking(id){
+  appointments = appointments.filter(a => a.id !== id);
+  await deleteAppointmentRecord(id);
+  clientLookupResults = appointments.filter(a => a.clientPhone === clientLookupPhone && a.date >= todayISO())
+    .sort((a,b) => (a.date+a.time).localeCompare(b.date+b.time));
+  render();
+}
+
+function requestCancelConfirm(type, id){ pendingConfirm = { type, id }; render(); }
+function cancelConfirmDismiss(){ pendingConfirm = null; render(); }
+async function cancelConfirmProceed(){
+  if(!pendingConfirm) return;
+  const { type, id } = pendingConfirm;
+  pendingConfirm = null;
+  if(type === 'admin') await adminCancel(id);
+  else if(type === 'client') await cancelOwnBooking(id);
+}
+
+function renderConfirmModal(){
+  if(!pendingConfirm) return '';
+  const appt = appointments.find(a => a.id === pendingConfirm.id);
+  const label = appt ? appt.clientName : 'este agendamento';
+  return `<div class="modal-overlay">
+    <div class="modal-box">
+      <p class="modal-text">Cancelar o agendamento de <strong>${escapeHtml(label)}</strong>? Essa ação não pode ser desfeita.</p>
+      <div class="btn-row">
+        <button class="secondary" style="flex:1;" onclick="cancelConfirmDismiss()">Voltar</button>
+        <button class="primary" style="flex:1; margin-top:0; background:#8C2F2F;" onclick="cancelConfirmProceed()">Sim, cancelar</button>
+      </div>
+    </div>
+  </div>`;
+}
 
 function playNotifySound(){
   try{
@@ -829,7 +934,7 @@ function renderNotifications(){
   if(notifications.length === 0) return '';
   return '<div class="toast-stack">' + notifications.map(n => {
     const isCancel = n.type === 'cancel';
-    return `<div class="toast ${isCancel?'toast-cancel':''}">
+    return `<div class="toast ${isCancel?'toast-cancel':'toast-new'}">
       <button class="toast-close" onclick="dismissNotification('${n.id}')">×</button>
       <div class="toast-title">${isCancel ? '⚠️ Agendamento cancelado' : '🔔 Novo agendamento'}</div>
       <div class="toast-body"><strong>${escapeHtml(n.name)}</strong><br>${displayDate(n.date)} às ${n.time} · ${escapeHtml(n.service||'')}</div>
@@ -1052,7 +1157,7 @@ function renderAdminAgenda(){
         <div class="info"><div class="name">${escapeHtml(a.clientName)}</div><div class="phone">${escapeHtml(maskPhone(a.clientPhone))}</div><div class="svc">${escapeHtml(a.serviceName||'')}</div></div>
         <div class="actions">
           <button class="edit" onclick="startEditAppointment('${a.id}')">Editar</button>
-          <button class="cancel" onclick="adminCancel('${a.id}')">Cancelar</button>
+          <button class="cancel" onclick="requestCancelConfirm('admin','${a.id}')">Cancelar</button>
         </div>
       </div>`;
     });
@@ -1351,6 +1456,15 @@ function renderAdminConfig(){
       <label class="field">Duração de cada horário na agenda (minutos)</label>
       <input type="number" id="cfgDuration" value="${config.slotDuration}" min="5" step="5">
 
+      <p class="section-label" style="margin-top:18px;">Tolerância dos horários do dia</p>
+      <label class="field">Minutos após o horário marcado até desativar automaticamente</label>
+      <input type="number" id="cfgTolerance" value="${config.slotTolerance}" min="0" step="1">
+      <p class="footer-note" style="text-align:left; margin-top:6px;">Se um horário de hoje passar e ninguém agendar, ele continua disponível (com um relógio contando) até esse tempo acabar — depois some da agenda automaticamente.</p>
+
+      <p class="section-label" style="margin-top:18px;">Contato no WhatsApp</p>
+      <input type="text" id="cfgWhatsapp" placeholder="https://wa.me/55DDDNUMERO" value="${escapeHtml(config.whatsappLink||'')}">
+      <p class="footer-note" style="text-align:left; margin-top:6px;">Aparece como botão na tela inicial do agendamento para o cliente tirar dúvidas.</p>
+
       <p class="section-label" style="margin-top:18px;">Horário de almoço</p>
       <div class="check-row"><div class="day-check ${lunchOn?'on':''}" onclick="toggleLunchBreak()">${lunchOn?'Intervalo ativado':'Ativar intervalo de almoço'}</div></div>
       ${lunchFields}
@@ -1410,6 +1524,10 @@ async function saveAdminConfig(){
   config.startTime = document.getElementById('cfgStart').value || DEFAULT_CONFIG.startTime;
   config.endTime = document.getElementById('cfgEnd').value || DEFAULT_CONFIG.endTime;
   config.slotDuration = Number(document.getElementById('cfgDuration').value) || DEFAULT_CONFIG.slotDuration;
+  const tolVal = Number(document.getElementById('cfgTolerance').value);
+  config.slotTolerance = isNaN(tolVal) || tolVal < 0 ? 15 : tolVal;
+  const waInput = document.getElementById('cfgWhatsapp');
+  config.whatsappLink = waInput ? waInput.value.trim() : config.whatsappLink;
   if(config.lunchBreak && config.lunchBreak.enabled){
     const ls = document.getElementById('cfgLunchStart');
     const le = document.getElementById('cfgLunchEnd');
@@ -1461,6 +1579,11 @@ function downloadBackupFile(){
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+
+setInterval(() => {
+  const onTimeStep = view === 'client' && !stampAppt && !clientSubView && selectedDate === todayISO() && selectedServiceId && !selectedTime;
+  if(onTimeStep) render();
+}, 1000);
 
 loadData();
 </script>
