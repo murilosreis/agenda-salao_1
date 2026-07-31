@@ -7,6 +7,7 @@
 <!-- Firebase (Firestore) — SDK compatível, sem precisar de build tools -->
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,600;0,700;1,600&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&family=Playfair+Display:ital,wght@0,600;0,700;1,600&family=Poppins:wght@400;500;600;700&family=Space+Mono:wght@400;700&family=Cormorant+Garamond:ital,wght@0,600;0,700;1,600&family=Work+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&family=Bodoni+Moda:ital,wght@0,600;0,700;1,600&family=Manrope:wght@400;500;600;700&family=Roboto+Mono:wght@500;600&family=Spectral:ital,wght@0,600;0,700;1,600&family=Nunito+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
 
@@ -182,6 +183,7 @@ button.link-btn{ background:none; border:none; color:var(--wine); font-size:13px
 .toast{ position:relative; background:var(--wine); color:#fff; border-radius:10px; padding:12px 34px 12px 16px; max-width:320px; width:90%; box-shadow:0 6px 20px rgba(0,0,0,0.25); animation:toastIn 0.25s ease-out; pointer-events:auto; }
 .toast-cancel{ background:#8C2F2F; }
 .toast-new{ background:#2F6B4F; }
+.toast-pending{ background:#A6742F; }
 .toast-close{ position:absolute; top:6px; right:8px; background:none; border:none; color:#fff; font-size:17px; line-height:1; cursor:pointer; opacity:0.85; padding:2px 4px; }
 .toast-close:hover{ opacity:1; }
 .toast-title{ font-family:var(--font-mono),monospace; font-size:12px; font-weight:600; letter-spacing:0.03em; opacity:0.9; margin-bottom:4px; }
@@ -211,11 +213,13 @@ const firebaseConfig = {
 };
 
 let db = null;
+let auth = null;
 let useFirestore = false;
 try{
   if(firebaseConfig.apiKey && firebaseConfig.apiKey !== 'COLE_AQUI' && typeof firebase !== 'undefined'){
     firebase.initializeApp(firebaseConfig);
     db = firebase.firestore();
+    auth = firebase.auth();
     useFirestore = true;
   }
 }catch(e){ useFirestore = false; }
@@ -234,7 +238,7 @@ const DEFAULT_CONFIG = {
     { id:'sv3', name:'Manicure', duration:40, price:35 }
   ],
   users: [
-    { id:'u1', name:'Administrador', pin:'1234' }
+    { id:'u1', name:'Administrador', email:'' }
   ],
   lunchBreak: { enabled:false, start:'12:00', end:'13:00' },
   logoUrl: '',
@@ -274,12 +278,22 @@ function applyTheme(){
 function maskPhone(value){
   const d = (value||'').replace(/\D/g,'').slice(0,11);
   if(d.length === 0) return '';
-  if(d.length <= 2) return '('+d;
-  if(d.length <= 6) return '('+d.slice(0,2)+') '+d.slice(2);
-  if(d.length <= 10) return '('+d.slice(0,2)+') '+d.slice(2,6)+'-'+d.slice(6);
-  return '('+d.slice(0,2)+') '+d.slice(2,7)+'-'+d.slice(7);
+  if(d.length <= 2) return d;
+  if(d.length <= 7) return d.slice(0,2)+' '+d.slice(2);
+  return d.slice(0,2)+' '+d.slice(2,7)+'-'+d.slice(7);
 }
 function onPhoneInput(el){ el.value = maskPhone(el.value); }
+function isValidPhone(value){ return (value||'').replace(/\D/g,'').length === 11; }
+function isFullName(value){ return (value||'').trim().split(/\s+/).filter(Boolean).length >= 2; }
+
+function getAllServicesVirtual(){
+  const total = config.services.reduce((sum,s) => sum + Number(s.price||0), 0);
+  return { id:'__all__', name:'Todos os serviços', price: total, duration: config.slotDuration };
+}
+function resolveService(id){
+  if(id === '__all__') return getAllServicesVirtual();
+  return config.services.find(s => s.id === id);
+}
 
 let config = null;
 let appointments = [];
@@ -290,10 +304,16 @@ let selectedDate = null;
 let selectedTime = null;
 let clientMonthOffset = 0;
 let clientSubView = null;
+let clients = [];
+let adminEditingClientId = null;
 let clientLookupResults = null;
 let clientLookupPhone = '';
 let stampAppt = null;
 let pendingConfirm = null;
+let cancelRequests = [];
+let cancelRequestPending = null;
+let cancelReqUnsub = null;
+let cancelReqFirstSnapshotDone = false;
 
 let adminUnlocked = false;
 let currentAdminUser = null;
@@ -413,6 +433,112 @@ async function deleteAppointmentRecord(id){
   return await persistAllAppointmentsFallback();
 }
 
+// ---- Clientes: um registro por telefone ----
+async function loadClientsFromStore(){
+  if(useFirestore){
+    try{
+      const snap = await db.collection('clients').get();
+      return snap.docs.map(d => d.data());
+    }catch(e){ return []; }
+  }
+  const c = await storageGet('clients', true);
+  return c ? JSON.parse(c.value) : [];
+}
+
+async function persistAllClientsFallback(){
+  try{ const r = await storageSet('clients', JSON.stringify(clients), true); return !!r; }
+  catch(e){ return false; }
+}
+
+async function upsertClientRecord(client){
+  if(useFirestore){
+    try{ await db.collection('clients').doc(client.id).set(client); return true; }
+    catch(e){ return false; }
+  }
+  return await persistAllClientsFallback();
+}
+
+async function deleteClientRecord(id){
+  if(useFirestore){
+    try{ await db.collection('clients').doc(id).delete(); return true; }
+    catch(e){ return false; }
+  }
+  return await persistAllClientsFallback();
+}
+
+async function upsertClientFromBooking(name, phone){
+  const phoneDigits = phone.replace(/\D/g,'');
+  if(!phoneDigits) return;
+  const now = new Date().toISOString();
+  if(useFirestore){
+    try{
+      const ref = db.collection('clients').doc(phoneDigits);
+      const snap = await ref.get();
+      if(snap.exists){
+        await ref.set({ name, phone, lastBookingAt: now }, { merge: true });
+      } else {
+        await ref.set({ id: phoneDigits, name, phone, firstSeenAt: now, lastBookingAt: now });
+      }
+    }catch(e){ /* não deve travar o agendamento se o cadastro de cliente falhar */ }
+    return;
+  }
+  let client = clients.find(c => c.id === phoneDigits);
+  if(client){
+    client.name = name; client.phone = phone; client.lastBookingAt = now;
+  } else {
+    client = { id: phoneDigits, name, phone, firstSeenAt: now, lastBookingAt: now };
+    clients.push(client);
+  }
+  await persistAllClientsFallback();
+}
+
+async function loadCancelRequestsFromStore(){
+  if(useFirestore){
+    try{
+      const snap = await db.collection('cancelRequests').get();
+      return snap.docs.map(d => d.data());
+    }catch(e){ return []; }
+  }
+  const c = await storageGet('cancelRequests', true);
+  return c ? JSON.parse(c.value) : [];
+}
+async function persistAllCancelRequestsFallback(){
+  try{ const r = await storageSet('cancelRequests', JSON.stringify(cancelRequests), true); return !!r; }
+  catch(e){ return false; }
+}
+async function addCancelRequestRecord(reqObj){
+  if(useFirestore){
+    try{ await db.collection('cancelRequests').doc(reqObj.id).set(reqObj); return true; }
+    catch(e){ return false; }
+  }
+  cancelRequests.push(reqObj);
+  return await persistAllCancelRequestsFallback();
+}
+async function deleteCancelRequestRecord(id){
+  if(useFirestore){
+    try{ await db.collection('cancelRequests').doc(id).delete(); return true; }
+    catch(e){ return false; }
+  }
+  return await persistAllCancelRequestsFallback();
+}
+function startCancelRequestsRealtimeSync(){
+  if(!useFirestore || cancelReqUnsub) return;
+  cancelReqUnsub = db.collection('cancelRequests').onSnapshot(snapshot => {
+    snapshot.docChanges().forEach(change => {
+      const data = change.doc.data();
+      if(change.type === 'added'){
+        const idx = cancelRequests.findIndex(r => r.id === data.id);
+        if(idx >= 0) cancelRequests[idx] = data; else cancelRequests.push(data);
+        if(cancelReqFirstSnapshotDone && adminUnlocked) notifyCancelRequest(data);
+      } else if(change.type === 'removed'){
+        cancelRequests = cancelRequests.filter(r => r.id !== data.id);
+      }
+    });
+    cancelReqFirstSnapshotDone = true;
+    render();
+  }, () => { /* mantém os dados já carregados em caso de erro de conexão */ });
+}
+
 async function loadData(){
   try{
     config = await loadConfigFromStore();
@@ -421,8 +547,13 @@ async function loadData(){
   let dirty = !config;
   if(!config.services){ config.services = DEFAULT_CONFIG.services; dirty = true; }
   if(!config.users || config.users.length === 0){
-    config.users = [{ id:'u1', name:'Administrador', pin: config.pin || '1234' }];
+    config.users = [{ id:'u1', name:'Administrador', pin: config.pin || '1234', email:'' }];
     dirty = true;
+  } else {
+    config.users.forEach(u => {
+      if(u.pin === undefined){ u.pin = '1234'; dirty = true; }
+      if(u.email === undefined){ u.email = ''; dirty = true; }
+    });
   }
   if(!config.blockedSlots) config.blockedSlots = {};
   if(!config.blockedDates) config.blockedDates = [];
@@ -439,13 +570,36 @@ async function loadData(){
   if(useFirestore){
     appointments = [];
     startRealtimeSync();
+    auth.onAuthStateChanged(user => {
+      if(user){
+        adminUnlocked = true;
+        const match = config.users.find(u => u.email && u.email.toLowerCase() === (user.email||'').toLowerCase());
+        currentAdminUser = match || { id:'auth', name:user.email, email:user.email };
+        loadStaffOnlyData();
+        checkAutoBackup();
+      } else {
+        adminUnlocked = false;
+        currentAdminUser = null;
+        clients = [];
+        cancelRequests = [];
+      }
+      checkEntryRoute();
+      render();
+    });
   } else {
     try{ appointments = await loadAppointmentsFromStore(); }catch(e){ appointments = []; }
+    try{ clients = await loadClientsFromStore(); }catch(e){ clients = []; }
+    restoreAdminSession();
   }
 
-  restoreAdminSession();
   checkEntryRoute();
   render();
+}
+
+async function loadStaffOnlyData(){
+  try{ clients = await loadClientsFromStore(); }catch(e){ clients = []; }
+  try{ cancelRequests = await loadCancelRequestsFromStore(); }catch(e){ cancelRequests = []; }
+  startCancelRequestsRealtimeSync();
 }
 
 function restoreAdminSession(){
@@ -651,6 +805,8 @@ function render(){
 
   if(stampAppt){
     html += renderStampScreen();
+  } else if(cancelRequestPending){
+    html += renderCancelRequestScreen();
   } else if(view === 'client') html += renderClient();
   else if(view === 'admin-lock') html += renderAdminLock();
   else if(view === 'admin') html += renderAdmin();
@@ -700,6 +856,13 @@ function renderClient(){
         <div class="sprice">${money(s.price)}</div>
       </div>`;
     });
+    if(config.services.length > 1){
+      const allSvc = getAllServicesVirtual();
+      html += `<div class="service-card" onclick="pickService('__all__')" style="border-color:var(--gold);">
+        <div><div class="sname">Todos os serviços</div><div class="smeta">combo completo</div></div>
+        <div class="sprice">${money(allSvc.price)}</div>
+      </div>`;
+    }
     html += '</div></div>';
     html += `<div class="card" style="text-align:center;">
       <button class="secondary" onclick="selectedDate=null; render();">← Voltar</button>
@@ -709,7 +872,7 @@ function renderClient(){
 
   if(selectedTime) return renderBookingForm();
 
-  const svc = config.services.find(s => s.id === selectedServiceId);
+  const svc = resolveService(selectedServiceId);
   let html = dateSummary;
   html += `<div class="card">
     <div class="step-summary">
@@ -761,14 +924,14 @@ function pickSlot(t){ selectedTime = t; render(); }
 
 function renderBookingForm(){
   const d = fromISODate(selectedDate);
-  const svc = config.services.find(s => s.id === selectedServiceId);
+  const svc = resolveService(selectedServiceId);
   return `<div class="card">
       <p class="section-label">Confirmar agendamento</p>
       <p class="confirm-detail">${escapeHtml(svc ? svc.name : '')}<br>${DOW_FULL[d.getDay()]}, ${displayDate(selectedDate)} <span class="b">às ${selectedTime}</span></p>
       <label class="field">Seu nome</label>
-      <input type="text" id="clientName" placeholder="Nome completo">
+      <input type="text" id="clientName" placeholder="Nome e sobrenome">
       <label class="field">WhatsApp / telefone</label>
-      <input type="tel" id="clientPhone" placeholder="(00) 00000-0000" inputmode="numeric" oninput="onPhoneInput(this)">
+      <input type="tel" id="clientPhone" placeholder="73 91234-5678" inputmode="numeric" oninput="onPhoneInput(this)">
       <button class="primary" onclick="confirmBooking()">Carimbar meu horário</button>
       <button class="secondary" onclick="selectedTime=null; render();">Voltar</button>
     </div>`;
@@ -778,11 +941,17 @@ async function confirmBooking(){
   const name = document.getElementById('clientName').value.trim();
   const phone = document.getElementById('clientPhone').value.trim();
   if(!name || !phone){ flashMsg = 'Preencha nome e telefone para confirmar.'; flashOk=false; render(); return; }
+  if(!isFullName(name)){ flashMsg = 'Informe nome e sobrenome, separados por espaço.'; flashOk=false; render(); return; }
+  if(!isValidPhone(phone)){ flashMsg = 'Informe o telefone completo, com DDD (ex: 73 91234-5678).'; flashOk=false; render(); return; }
+  const sameDayCount = appointments.filter(a => a.clientPhone === phone && a.date === selectedDate).length;
+  if(sameDayCount >= 2){
+    flashMsg = 'Esse telefone já tem 2 agendamentos nesse dia. Entre em contato com o salão para mais horários.'; flashOk=false; render(); return;
+  }
   if(slotStatus(selectedDate, selectedTime) !== 'available'){
     flashMsg = 'Esse horário acabou de ser ocupado. Escolha outro.'; flashOk=false;
     selectedTime = null; render(); return;
   }
-  const svc = config.services.find(s => s.id === selectedServiceId);
+  const svc = resolveService(selectedServiceId);
   const appt = {
     id: 'a'+Date.now()+Math.floor(Math.random()*1000),
     date: selectedDate, time: selectedTime,
@@ -794,6 +963,7 @@ async function confirmBooking(){
   };
   appointments.push(appt);
   await addAppointmentRecord(appt);
+  await upsertClientFromBooking(name, phone);
   showStamp(appt);
 }
 
@@ -831,7 +1001,7 @@ function renderLookupScreen(){
   let html = `<div class="card">
       <p class="section-label">Buscar meu horário</p>
       <label class="field">Telefone usado no agendamento</label>
-      <input type="tel" id="lookupPhone" placeholder="(00) 00000-0000" inputmode="numeric" oninput="onPhoneInput(this)" value="${escapeHtml(clientLookupPhone)}">
+      <input type="tel" id="lookupPhone" placeholder="73 91234-5678" inputmode="numeric" oninput="onPhoneInput(this)" value="${escapeHtml(clientLookupPhone)}">
       <button class="primary" onclick="lookupBookings()">Buscar</button>
       <button class="secondary" onclick="resetClient()">← Voltar</button>`;
   if(clientLookupResults !== null){
@@ -856,16 +1026,138 @@ function renderLookupScreen(){
 
 function lookupBookings(){
   clientLookupPhone = document.getElementById('lookupPhone').value.trim();
+  if(!isValidPhone(clientLookupPhone)){
+    clientLookupResults = null;
+    flashMsg = 'Informe o telefone completo, com DDD (ex: 73 91234-5678).'; flashOk = false;
+    render(); return;
+  }
   clientLookupResults = appointments.filter(a => a.clientPhone === clientLookupPhone && a.date >= todayISO())
     .sort((a,b) => (a.date+a.time).localeCompare(b.date+b.time));
   render();
 }
 
-async function cancelOwnBooking(id){
-  appointments = appointments.filter(a => a.id !== id);
-  await deleteAppointmentRecord(id);
-  clientLookupResults = appointments.filter(a => a.clientPhone === clientLookupPhone && a.date >= todayISO())
-    .sort((a,b) => (a.date+a.time).localeCompare(b.date+b.time));
+async function requestClientCancellation(id){
+  const appt = appointments.find(a => a.id === id);
+  if(!appt) return;
+  const code = String(Math.floor(100000 + Math.random()*900000));
+  const reqObj = {
+    id: 'cr'+Date.now()+Math.floor(Math.random()*1000),
+    code,
+    appointmentId: id,
+    clientName: appt.clientName,
+    clientPhone: appt.clientPhone,
+    date: appt.date,
+    time: appt.time,
+    serviceName: appt.serviceName,
+    createdAt: new Date().toISOString()
+  };
+  await addCancelRequestRecord(reqObj);
+  cancelRequestPending = reqObj;
+  render();
+}
+
+function buildWhatsappCancelLink(reqObj){
+  const digits = (config.whatsappLink||'').replace(/\D/g,'');
+  if(!digits) return null;
+  const msg = `Olá! Quero confirmar o cancelamento do meu agendamento (${reqObj.serviceName}, ${displayDate(reqObj.date)} às ${reqObj.time}). Código: ${reqObj.code}`;
+  return `https://wa.me/${digits}?text=${encodeURIComponent(msg)}`;
+}
+
+function renderCancelRequestScreen(){
+  const req = cancelRequestPending;
+  const waLink = buildWhatsappCancelLink(req);
+  return `<div class="card">
+      <p class="section-label">Pedido de cancelamento gerado</p>
+      <p style="font-size:14px; line-height:1.6; color:var(--ink);">
+        Guarde este código e envie para o salão pelo WhatsApp. O cancelamento só é efetivado depois que a equipe confirmar.
+      </p>
+      <div class="stamp-wrap">
+        <p class="confirm-detail" style="font-size:28px; letter-spacing:0.08em;"><strong>${req.code}</strong></p>
+      </div>
+      <p style="font-size:13px; color:var(--ink-soft); margin-top:8px;">${escapeHtml(req.serviceName||'')} · ${displayDate(req.date)} às ${req.time}</p>
+      ${waLink ? `<a href="${waLink}" target="_blank" rel="noopener" class="whatsapp-btn" style="display:block; text-align:center; margin-top:16px;">💬 Enviar código pelo WhatsApp</a>` : ''}
+      <button class="secondary" style="margin-top:14px;" onclick="cancelRequestPending=null; resetClient();">Fechar</button>
+    </div>`;
+}
+
+async function confirmCancelRequest(reqId){
+  const req = cancelRequests.find(r => r.id === reqId);
+  if(!req) return;
+  const typedEl = document.getElementById('cancelCode_'+reqId);
+  const typed = typedEl ? typedEl.value.trim() : '';
+  if(typed !== req.code){ flashMsg = 'Código incorreto.'; flashOk=false; render(); return; }
+  localPendingDeletes.add(req.appointmentId);
+  appointments = appointments.filter(a => a.id !== req.appointmentId);
+  await deleteAppointmentRecord(req.appointmentId);
+  cancelRequests = cancelRequests.filter(r => r.id !== reqId);
+  await deleteCancelRequestRecord(reqId);
+  flashMsg = 'Cancelamento confirmado.'; flashOk = true;
+  render();
+}
+
+async function rejectCancelRequest(reqId){
+  cancelRequests = cancelRequests.filter(r => r.id !== reqId);
+  await deleteCancelRequestRecord(reqId);
+  render();
+}
+
+function renderAdminClientes(){
+  let html = `<div class="card"><p class="section-label">Clientes cadastrados (${clients.length})</p>`;
+  if(clients.length === 0){
+    html += '<p class="empty-note">Nenhum cliente cadastrado ainda. O cadastro é criado automaticamente quando alguém agenda pela primeira vez.</p>';
+  }
+  const sorted = [...clients].sort((a,b) => a.name.localeCompare(b.name, 'pt-BR'));
+  sorted.forEach(c => {
+    if(adminEditingClientId === c.id){
+      html += `<div class="svc-edit-form">
+        <label class="field" style="margin-top:0;">Nome</label>
+        <input type="text" id="editClientName_${c.id}" value="${escapeHtml(c.name)}">
+        <label class="field">Telefone</label>
+        <input type="tel" id="editClientPhone_${c.id}" value="${escapeHtml(c.phone)}" inputmode="numeric" oninput="onPhoneInput(this)">
+        <div class="btn-row">
+          <button class="secondary" style="flex:1;" onclick="cancelEditClient()">Cancelar</button>
+          <button class="primary" style="flex:1; margin-top:0;" onclick="saveEditClient('${c.id}')">Salvar</button>
+        </div>
+      </div>`;
+    } else {
+      html += `<div class="svc-row">
+        <div><strong>${escapeHtml(c.name)}</strong><br><span style="color:var(--ink-soft); font-family:var(--font-mono),monospace; font-size:13px;">${escapeHtml(c.phone)}</span></div>
+        <div class="svc-row-actions">
+          <button class="edit-btn" onclick="startEditClient('${c.id}')">Editar</button>
+          <button class="del-btn" onclick="requestDeleteClientConfirm('${c.id}')">Excluir</button>
+        </div>
+      </div>`;
+    }
+  });
+  html += '</div>';
+  return html;
+}
+
+function startEditClient(id){ adminEditingClientId = id; render(); }
+function cancelEditClient(){ adminEditingClientId = null; render(); }
+
+async function saveEditClient(id){
+  const client = clients.find(c => c.id === id);
+  if(!client) return;
+  const name = document.getElementById('editClientName_'+id).value.trim();
+  const phone = document.getElementById('editClientPhone_'+id).value.trim();
+  if(!name || !isValidPhone(phone)){
+    flashMsg = 'Informe nome e telefone completo, com DDD (ex: 73 91234-5678).'; flashOk = false; render(); return;
+  }
+  client.name = name;
+  client.phone = phone;
+  adminEditingClientId = null;
+  flashMsg = 'Cliente atualizado.'; flashOk = true;
+  await upsertClientRecord(client);
+  render();
+}
+
+function requestDeleteClientConfirm(id){ pendingConfirm = { type:'client-delete', id }; render(); }
+
+async function deleteClientNow(id){
+  clients = clients.filter(c => c.id !== id);
+  if(adminEditingClientId === id) adminEditingClientId = null;
+  await deleteClientRecord(id);
   render();
 }
 
@@ -876,19 +1168,32 @@ async function cancelConfirmProceed(){
   const { type, id } = pendingConfirm;
   pendingConfirm = null;
   if(type === 'admin') await adminCancel(id);
-  else if(type === 'client') await cancelOwnBooking(id);
+  else if(type === 'client') await requestClientCancellation(id);
+  else if(type === 'client-delete') await deleteClientNow(id);
 }
 
 function renderConfirmModal(){
   if(!pendingConfirm) return '';
-  const appt = appointments.find(a => a.id === pendingConfirm.id);
-  const label = appt ? appt.clientName : 'este agendamento';
+  let message;
+  if(pendingConfirm.type === 'client-delete'){
+    const c = clients.find(cl => cl.id === pendingConfirm.id);
+    const label = c ? c.name : 'este cliente';
+    message = `Excluir o cadastro de <strong>${escapeHtml(label)}</strong>? Essa ação não pode ser desfeita.`;
+  } else if(pendingConfirm.type === 'client'){
+    const appt = appointments.find(a => a.id === pendingConfirm.id);
+    const label = appt ? appt.clientName : 'este agendamento';
+    message = `Cancelar o agendamento de <strong>${escapeHtml(label)}</strong>? Vamos gerar um código que você precisa enviar pelo WhatsApp do salão — o cancelamento só é efetivado depois que a equipe confirmar.`;
+  } else {
+    const appt = appointments.find(a => a.id === pendingConfirm.id);
+    const label = appt ? appt.clientName : 'este agendamento';
+    message = `Cancelar o agendamento de <strong>${escapeHtml(label)}</strong>? Essa ação não pode ser desfeita.`;
+  }
   return `<div class="modal-overlay">
     <div class="modal-box">
-      <p class="modal-text">Cancelar o agendamento de <strong>${escapeHtml(label)}</strong>? Essa ação não pode ser desfeita.</p>
+      <p class="modal-text">${message}</p>
       <div class="btn-row">
         <button class="secondary" style="flex:1;" onclick="cancelConfirmDismiss()">Voltar</button>
-        <button class="primary" style="flex:1; margin-top:0; background:#8C2F2F;" onclick="cancelConfirmProceed()">Sim, cancelar</button>
+        <button class="primary" style="flex:1; margin-top:0; background:#8C2F2F;" onclick="cancelConfirmProceed()">Sim, confirmar</button>
       </div>
     </div>
   </div>`;
@@ -930,14 +1235,23 @@ function dismissNotification(id){
   render();
 }
 
+function notifyCancelRequest(reqObj){
+  const id = 'n'+Date.now()+Math.random().toString(36).slice(2);
+  notifications.push({ id, type:'cancel-request', name: reqObj.clientName, date: reqObj.date, time: reqObj.time, service: reqObj.serviceName, code: reqObj.code });
+  playNotifySound();
+  render();
+}
+
 function renderNotifications(){
   if(notifications.length === 0) return '';
   return '<div class="toast-stack">' + notifications.map(n => {
-    const isCancel = n.type === 'cancel';
-    return `<div class="toast ${isCancel?'toast-cancel':'toast-new'}">
+    const cls = n.type === 'cancel' ? 'toast-cancel' : (n.type === 'cancel-request' ? 'toast-pending' : 'toast-new');
+    const title = n.type === 'cancel' ? '⚠️ Agendamento cancelado' : (n.type === 'cancel-request' ? '⏳ Pedido de cancelamento' : '🔔 Novo agendamento');
+    const codeLine = n.type === 'cancel-request' ? `<br>Código: <strong>${escapeHtml(n.code)}</strong> (confirme na Agenda)` : '';
+    return `<div class="toast ${cls}">
       <button class="toast-close" onclick="dismissNotification('${n.id}')">×</button>
-      <div class="toast-title">${isCancel ? '⚠️ Agendamento cancelado' : '🔔 Novo agendamento'}</div>
-      <div class="toast-body"><strong>${escapeHtml(n.name)}</strong><br>${displayDate(n.date)} às ${n.time} · ${escapeHtml(n.service||'')}</div>
+      <div class="toast-title">${title}</div>
+      <div class="toast-body"><strong>${escapeHtml(n.name)}</strong><br>${displayDate(n.date)} às ${n.time} · ${escapeHtml(n.service||'')}${codeLine}</div>
     </div>`;
   }).join('') + '</div>';
 }
@@ -945,6 +1259,17 @@ function renderNotifications(){
 function goAdmin(){ view = adminUnlocked ? 'admin' : 'admin-lock'; render(); }
 
 function renderAdminLock(){
+  if(useFirestore){
+    return `<div class="card">
+        <p class="section-label">Área da equipe</p>
+        <label class="field">E-mail</label>
+        <input type="email" id="authEmail" placeholder="voce@salao.com" autocomplete="username">
+        <label class="field">Senha</label>
+        <input type="password" id="authPassword" placeholder="••••••••" autocomplete="current-password">
+        <button class="primary" onclick="tryUnlockAuth()">Entrar</button>
+        <button class="secondary" onclick="location.hash=''; view='client'; render();">Voltar</button>
+      </div>`;
+  }
   return `<div class="card">
       <p class="section-label">Área da equipe</p>
       <label class="field">PIN de acesso</label>
@@ -952,6 +1277,30 @@ function renderAdminLock(){
       <button class="primary" onclick="tryUnlock()">Entrar</button>
       <button class="secondary" onclick="location.hash=''; view='client'; render();">Voltar</button>
     </div>`;
+}
+
+async function tryUnlockAuth(){
+  const email = document.getElementById('authEmail').value.trim();
+  const password = document.getElementById('authPassword').value;
+  if(!email || !password){ flashMsg = 'Preencha e-mail e senha.'; flashOk=false; render(); return; }
+  try{
+    await auth.signInWithEmailAndPassword(email, password);
+    view = 'admin'; adminTab = 'dashboard';
+  }catch(e){
+    flashMsg = 'E-mail ou senha incorretos.'; flashOk=false;
+  }
+  render();
+}
+
+function doLogout(){
+  location.hash = '';
+  if(useFirestore && auth){
+    auth.signOut();
+  } else {
+    adminUnlocked = false; currentAdminUser = null;
+    try{ localStorage.removeItem(ADMIN_SESSION_KEY); }catch(e){}
+  }
+  resetClient();
 }
 
 function tryUnlock(){
@@ -969,13 +1318,14 @@ function tryUnlock(){
 function renderAdmin(){
   let html = `<div class="card" style="padding:10px 14px; display:flex; justify-content:space-between; align-items:center;">
     <span style="font-size:13px;">Olá, <strong>${escapeHtml(currentAdminUser.name)}</strong></span>
-    <button class="link-btn" onclick="location.hash=''; adminUnlocked=false; currentAdminUser=null; try{localStorage.removeItem(ADMIN_SESSION_KEY);}catch(e){} resetClient();">Sair</button>
+    <button class="link-btn" onclick="doLogout()">Sair</button>
   </div>`;
   html += `<div class="tabbar">
     <button class="${adminTab==='dashboard'?'active':''}" onclick="setAdminTab('dashboard')">Painel</button>
     <button class="${adminTab==='agenda'?'active':''}" onclick="setAdminTab('agenda')">Agenda</button>
     <button class="${adminTab==='horarios'?'active':''}" onclick="setAdminTab('horarios')">Horários</button>
     <button class="${adminTab==='servicos'?'active':''}" onclick="setAdminTab('servicos')">Serviços</button>
+    <button class="${adminTab==='clientes'?'active':''}" onclick="setAdminTab('clientes')">Clientes</button>
     <button class="${adminTab==='equipe'?'active':''}" onclick="setAdminTab('equipe')">Equipe</button>
     <button class="${adminTab==='config'?'active':''}" onclick="setAdminTab('config')">Ajustes</button>
   </div>`;
@@ -984,12 +1334,13 @@ function renderAdmin(){
   else if(adminTab === 'agenda') html += renderAdminAgenda();
   else if(adminTab === 'horarios') html += renderAdminHorarios();
   else if(adminTab === 'servicos') html += renderAdminServicos();
+  else if(adminTab === 'clientes') html += renderAdminClientes();
   else if(adminTab === 'equipe') html += renderAdminEquipe();
   else if(adminTab === 'config') html += renderAdminConfig();
   return html;
 }
 
-function setAdminTab(t){ adminTab = t; adminEditingId = null; adminEditingServiceId = null; render(); }
+function setAdminTab(t){ adminTab = t; adminEditingId = null; adminEditingServiceId = null; adminEditingClientId = null; render(); }
 
 function renderDashboard(){
   const today = todayISO();
@@ -1099,6 +1450,30 @@ function renderSvcBarChart(done, todo){
 function setAgendaFilter(f){ adminAgendaFilter = f; adminAgendaCustomDate = null; render(); }
 function setAgendaCustomDate(v){ adminAgendaCustomDate = v || null; render(); }
 
+function renderCancelRequestsSection(){
+  if(cancelRequests.length === 0) return '';
+  const sorted = [...cancelRequests].sort((a,b) => (a.createdAt||'').localeCompare(b.createdAt||''));
+  let html = `<div class="card">
+    <p class="section-label">⏳ Pedidos de cancelamento (${sorted.length})</p>
+    <p class="footer-note" style="text-align:left;">Peça o código pelo WhatsApp e confirme aqui antes de cancelar.</p>`;
+  sorted.forEach(r => {
+    html += `<div class="svc-edit-form">
+      <div style="font-size:13px; margin-bottom:8px;">
+        <strong>${escapeHtml(r.clientName)}</strong> · ${escapeHtml(maskPhone(r.clientPhone))}<br>
+        ${escapeHtml(r.serviceName||'')} · ${displayDate(r.date)} às ${r.time}
+      </div>
+      <label class="field" style="margin-top:0;">Código informado pelo cliente</label>
+      <input type="text" id="cancelCode_${r.id}" placeholder="000000" inputmode="numeric" maxlength="6">
+      <div class="btn-row">
+        <button class="secondary" style="flex:1;" onclick="rejectCancelRequest('${r.id}')">Recusar</button>
+        <button class="primary" style="flex:1; margin-top:0; background:#8C2F2F;" onclick="confirmCancelRequest('${r.id}')">Confirmar cancelamento</button>
+      </div>
+    </div>`;
+  });
+  html += '</div>';
+  return html;
+}
+
 function renderAdminAgenda(){
   if(adminEditingId) return renderAdminEditAppointment();
 
@@ -1132,7 +1507,8 @@ function renderAdminAgenda(){
   }
   list = [...list].sort((a,b) => (a.date+a.time).localeCompare(b.date+b.time));
 
-  let html = `<div class="card">
+  let html = renderCancelRequestsSection();
+  html += `<div class="card">
     <div class="filter-row">
       <button class="${adminAgendaFilter==='today'&&!adminAgendaCustomDate?'active':''}" onclick="setAgendaFilter('today')">Hoje</button>
       <button class="${adminAgendaFilter==='week'&&!adminAgendaCustomDate?'active':''}" onclick="setAgendaFilter('week')">Semana</button>
@@ -1220,8 +1596,10 @@ async function saveEditAppointment(){
   const a = appointments.find(x => x.id === adminEditingId);
   if(!a) return;
   if(!adminEditTime){ flashMsg = 'Escolha um horário para salvar.'; flashOk=false; render(); return; }
+  const newPhone = document.getElementById('editPhone').value.trim() || a.clientPhone;
+  if(!isValidPhone(newPhone)){ flashMsg = 'Informe o telefone completo, com DDD (ex: 73 91234-5678).'; flashOk=false; render(); return; }
   a.clientName = document.getElementById('editName').value.trim() || a.clientName;
-  a.clientPhone = document.getElementById('editPhone').value.trim() || a.clientPhone;
+  a.clientPhone = newPhone;
   a.date = adminEditDate;
   a.time = adminEditTime;
   await updateAppointmentRecord(a);
@@ -1359,8 +1737,9 @@ async function removeService(id){
 function renderAdminEquipe(){
   let html = `<div class="card"><p class="section-label">Usuários com acesso</p>`;
   config.users.forEach(u => {
+    const detail = useFirestore ? (u.email || '(sem e-mail definido)') : ('PIN '+(u.pin||''));
     html += `<div class="user-row">
-      <div><strong>${escapeHtml(u.name)}</strong> <span style="color:var(--ink-soft); font-family:var(--font-mono),monospace; font-size:12px;">PIN ${escapeHtml(u.pin)}</span></div>
+      <div><strong>${escapeHtml(u.name)}</strong> <span style="color:var(--ink-soft); font-family:var(--font-mono),monospace; font-size:12px;">${escapeHtml(detail)}</span></div>
       <button class="cancel" style="background:none;border:none;cursor:pointer;text-decoration:underline;color:#B4453B;" onclick="removeUser('${u.id}')">Remover</button>
     </div>`;
   });
@@ -1368,20 +1747,36 @@ function renderAdminEquipe(){
   <div class="card">
     <p class="section-label">Novo usuário</p>
     <label class="field">Nome</label>
-    <input type="text" id="newUserName" placeholder="Ex: Fernanda">
-    <label class="field">PIN de acesso</label>
-    <input type="text" id="newUserPin" placeholder="0000" inputmode="numeric">
-    <button class="primary" onclick="addUser()">Cadastrar usuário</button>
+    <input type="text" id="newUserName" placeholder="Ex: Fernanda">`;
+  if(useFirestore){
+    html += `<label class="field">E-mail de login</label>
+    <input type="text" id="newUserEmail" placeholder="fernanda@salao.com">
+    <p class="footer-note" style="text-align:left; margin-top:6px;">Isso só liga o nome ao e-mail para exibir "Olá, Fernanda" — a conta de login de verdade precisa ser criada no console do Firebase, em Authentication → Users, com esse mesmo e-mail e uma senha.</p>`;
+  } else {
+    html += `<label class="field">PIN de acesso</label>
+    <input type="text" id="newUserPin" placeholder="0000" inputmode="numeric">`;
+  }
+  html += `<button class="primary" onclick="addUser()">Cadastrar usuário</button>
   </div>`;
   return html;
 }
 
 async function addUser(){
   const name = document.getElementById('newUserName').value.trim();
-  const pin = document.getElementById('newUserPin').value.trim();
-  if(!name || !pin){ flashMsg = 'Preencha nome e PIN.'; flashOk=false; render(); return; }
-  if(config.users.some(u => u.pin === pin)){ flashMsg = 'Já existe um usuário com esse PIN.'; flashOk=false; render(); return; }
-  config.users.push({ id:'u'+Date.now(), name, pin });
+  if(!name){ flashMsg = 'Preencha o nome.'; flashOk=false; render(); return; }
+  if(useFirestore){
+    const email = document.getElementById('newUserEmail').value.trim();
+    if(!email){ flashMsg = 'Preencha o e-mail.'; flashOk=false; render(); return; }
+    if(config.users.some(u => u.email && u.email.toLowerCase() === email.toLowerCase())){
+      flashMsg = 'Já existe um usuário com esse e-mail.'; flashOk=false; render(); return;
+    }
+    config.users.push({ id:'u'+Date.now(), name, email, pin:'' });
+  } else {
+    const pin = document.getElementById('newUserPin').value.trim();
+    if(!pin){ flashMsg = 'Preencha o PIN.'; flashOk=false; render(); return; }
+    if(config.users.some(u => u.pin === pin)){ flashMsg = 'Já existe um usuário com esse PIN.'; flashOk=false; render(); return; }
+    config.users.push({ id:'u'+Date.now(), name, pin, email:'' });
+  }
   flashMsg = 'Usuário cadastrado.'; flashOk = true;
   await saveConfig();
 }
