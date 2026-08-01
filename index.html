@@ -200,6 +200,7 @@ button.link-btn:hover{ text-decoration:underline; }
 .svc-row-actions button{ background:none; border:none; cursor:pointer; text-decoration:underline; font-size:11px; }
 .svc-row-actions .edit-btn{ color:var(--gold); }
 .svc-row-actions .del-btn{ color:#B4453B; }
+.badge-block{ display:inline-block; background:#8C2F2F; color:#fff; font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:0.3px; padding:2px 7px; border-radius:20px; vertical-align:middle; }
 
 .palette-row{ display:flex; gap:10px; flex-wrap:wrap; margin-top:8px; }
 .palette-swatch{ width:42px; height:42px; border-radius:50%; cursor:pointer; border:2px solid var(--line); flex-shrink:0; box-shadow:0 1px 0 rgba(43,27,46,0.05); }
@@ -224,6 +225,23 @@ button.link-btn:hover{ text-decoration:underline; }
 .toast-title{ font-family:var(--font-mono),monospace; font-size:12px; font-weight:600; letter-spacing:0.03em; opacity:0.9; margin-bottom:4px; }
 .toast-body{ font-size:13px; line-height:1.4; }
 @keyframes toastIn{ from{ opacity:0; transform:translateY(-10px); } to{ opacity:1; transform:translateY(0); } }
+.admin-shell{ display:flex; flex-direction:column; }
+.admin-sidebar{ width:100%; }
+.admin-content{ min-width:0; }
+
+@media (min-width: 880px){
+  .app.admin-mode{ max-width:1120px; }
+  .app.admin-mode .masthead{ padding:20px; margin-bottom:18px; }
+  .app.admin-mode .masthead h1{ font-size:22px; }
+  .app.admin-mode .admin-shell{ flex-direction:row; align-items:flex-start; gap:22px; }
+  .app.admin-mode .admin-sidebar{ width:210px; flex-shrink:0; position:sticky; top:20px; }
+  .app.admin-mode .tabbar{ flex-direction:column; padding:8px; }
+  .app.admin-mode .tabbar button{ text-align:left; padding:11px 14px; }
+  .app.admin-mode .admin-content{ flex:1; }
+  .app.admin-mode .admin-content .metric-grid{ grid-template-columns:repeat(4,1fr); }
+  .app.admin-mode .admin-content .service-list{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .app.admin-mode .filter-row{ max-width:420px; }
+}
 </style>
 </head>
 <body>
@@ -314,11 +332,15 @@ function maskPhone(value){
   const d = (value||'').replace(/\D/g,'').slice(0,11);
   if(d.length === 0) return '';
   if(d.length <= 2) return d;
-  if(d.length <= 7) return d.slice(0,2)+' '+d.slice(2);
+  if(d.length <= 6) return d.slice(0,2)+' '+d.slice(2);
+  if(d.length <= 10) return d.slice(0,2)+' '+d.slice(2,6)+'-'+d.slice(6);
   return d.slice(0,2)+' '+d.slice(2,7)+'-'+d.slice(7);
 }
 function onPhoneInput(el){ el.value = maskPhone(el.value); }
-function isValidPhone(value){ return (value||'').replace(/\D/g,'').length === 11; }
+function isValidPhone(value){
+  const n = (value||'').replace(/\D/g,'').length;
+  return n === 10 || n === 11;
+}
 function isFullName(value){ return (value||'').trim().split(/\s+/).filter(Boolean).length >= 2; }
 
 // Resolve os serviços selecionados (um ou mais) em um objeto combinado: nome, preço total, duração total.
@@ -339,6 +361,8 @@ let view = 'client';
 
 let selectedServiceIds = [];
 let bookingServicesConfirmed = false;
+let bookingNameDraft = '';
+let bookingPhoneDraft = '';
 let selectedDate = null;
 let selectedTime = null;
 let clientMonthOffset = 0;
@@ -636,9 +660,30 @@ async function loadData(){
 }
 
 async function loadStaffOnlyData(){
-  try{ clients = await loadClientsFromStore(); }catch(e){ clients = []; }
+  if(useFirestore){
+    startClientsRealtimeSync();
+  } else {
+    try{ clients = await loadClientsFromStore(); }catch(e){ clients = []; }
+  }
   try{ cancelRequests = await loadCancelRequestsFromStore(); }catch(e){ cancelRequests = []; }
   startCancelRequestsRealtimeSync();
+}
+
+let clientsUnsub = null;
+function startClientsRealtimeSync(){
+  if(!useFirestore || clientsUnsub) return;
+  clientsUnsub = db.collection('clients').onSnapshot(snapshot => {
+    snapshot.docChanges().forEach(change => {
+      const data = change.doc.data();
+      if(change.type === 'added' || change.type === 'modified'){
+        const idx = clients.findIndex(c => c.id === data.id);
+        if(idx >= 0) clients[idx] = data; else clients.push(data);
+      } else if(change.type === 'removed'){
+        clients = clients.filter(c => c.id !== data.id);
+      }
+    });
+    render();
+  }, () => { /* mantém os dados já carregados em caso de erro de conexão */ });
 }
 
 function restoreAdminSession(){
@@ -746,8 +791,17 @@ function computeSlotTiming(iso, time){
   return { status:'expired' };
 }
 
+function isTodayOver(iso){
+  if(iso !== todayISO()) return false;
+  const slots = generateSlots();
+  if(slots.length === 0) return false;
+  // "acabou por hoje" = todos os horários já passaram do relógio (independente de terem sido reservados ou não)
+  return slots.every(t => computeSlotTiming(iso, t).status === 'expired');
+}
+
 function isDayFull(iso){
   if(!isDayOpen(iso)) return false;
+  if(isTodayOver(iso)) return false; // isso é "fechado por hoje ter acabado", não "lotado"
   const slots = generateSlots();
   if(slots.length === 0) return false;
   return slots.every(t => {
@@ -806,6 +860,10 @@ function renderCalendar(opts){
       let inner = `${d.getDate()}`;
       if(isPast){ cls += ' past'; }
       else if(closed && !opts.allowClosed){ cls += ' closed'; }
+      else if(!opts.allowClosed && isTodayOver(iso)){
+        cls += ' closed';
+        inner = `<div style="display:flex;flex-direction:column;align-items:center;line-height:1.15;"><span>${d.getDate()}</span><span class="full-label">Fechado</span></div>`;
+      }
       else{
         const full = isDayFull(iso);
         if(full){
@@ -830,6 +888,7 @@ function render(){
   const app = document.getElementById('app');
   if(!config){ app.innerHTML = '<div class="loading">Abrindo a agenda...</div>'; return; }
   applyTheme();
+  app.className = 'app' + (view === 'admin' ? ' admin-mode' : '');
 
   const logoHtml = config.logoUrl ? `<img class="masthead-logo" src="${escapeHtml(config.logoUrl)}" alt="logo" onerror="this.style.display='none'">` : '';
   let html = `<div class="masthead">
@@ -977,9 +1036,9 @@ function renderBookingForm(){
       <p class="section-label">Confirmar agendamento</p>
       <p class="confirm-detail">${escapeHtml(svc ? svc.name : '')}<br>${DOW_FULL[d.getDay()]}, ${displayDate(selectedDate)} <span class="b">às ${selectedTime}</span></p>
       <label class="field">Seu nome</label>
-      <input type="text" id="clientName" placeholder="Nome e sobrenome">
+      <input type="text" id="clientName" placeholder="Nome e sobrenome" value="${escapeHtml(bookingNameDraft)}" oninput="bookingNameDraft=this.value;">
       <label class="field">WhatsApp / telefone</label>
-      <input type="tel" id="clientPhone" placeholder="73 91234-5678" inputmode="numeric" oninput="onPhoneInput(this)">
+      <input type="tel" id="clientPhone" placeholder="73 91234-5678" inputmode="numeric" value="${escapeHtml(bookingPhoneDraft)}" oninput="onPhoneInput(this); bookingPhoneDraft=this.value;">
       <button class="primary" onclick="confirmBooking()">Carimbar meu horário</button>
       <button class="secondary" onclick="selectedTime=null; render();">Voltar</button>
     </div>`;
@@ -988,9 +1047,15 @@ function renderBookingForm(){
 async function confirmBooking(){
   const name = document.getElementById('clientName').value.trim();
   const phone = document.getElementById('clientPhone').value.trim();
+  bookingNameDraft = name;
+  bookingPhoneDraft = document.getElementById('clientPhone').value;
   if(!name || !phone){ flashMsg = 'Preencha nome e telefone para confirmar.'; flashOk=false; render(); return; }
-  if(!isFullName(name)){ flashMsg = 'Informe nome e sobrenome, separados por espaço.'; flashOk=false; render(); return; }
-  if(!isValidPhone(phone)){ flashMsg = 'Informe o telefone completo, com DDD (ex: 73 91234-5678).'; flashOk=false; render(); return; }
+  if(!isFullName(name)){ flashMsg = 'O sobrenome é obrigatório. Complete seu nome (nome e sobrenome, separados por espaço).'; flashOk=false; render(); return; }
+  if(!isValidPhone(phone)){ flashMsg = 'Informe o telefone completo, com DDD (celular ou fixo, ex: 73 91234-5678 ou 73 3234-5678).'; flashOk=false; render(); return; }
+  const phoneDigits = phone.replace(/\D/g,'');
+  if(await isPhoneBlacklisted(phoneDigits)){
+    flashMsg = 'Não foi possível concluir o agendamento. Entre em contato com o salão.'; flashOk=false; render(); return;
+  }
   const sameDayCount = appointments.filter(a => a.clientPhone === phone && a.date === selectedDate).length;
   if(sameDayCount >= 2){
     flashMsg = 'Esse telefone já tem 2 agendamentos nesse dia. Entre em contato com o salão para mais horários.'; flashOk=false; render(); return;
@@ -1013,7 +1078,20 @@ async function confirmBooking(){
   appointments.push(appt);
   await addAppointmentRecord(appt);
   await upsertClientFromBooking(name, phone);
+  bookingNameDraft = ''; bookingPhoneDraft = '';
   showStamp(appt);
+}
+
+async function isPhoneBlacklisted(phoneDigits){
+  if(!phoneDigits) return false;
+  if(useFirestore){
+    try{
+      const snap = await db.collection('clients').doc(phoneDigits).get();
+      return snap.exists && snap.data().blacklisted === true;
+    }catch(e){ return false; }
+  }
+  const c = clients.find(cl => cl.id === phoneDigits);
+  return !!(c && c.blacklisted);
 }
 
 function showStamp(appt){
@@ -1041,6 +1119,7 @@ function renderStampScreen(){
 function resetClient(){
   selectedServiceIds=[]; bookingServicesConfirmed=false; selectedDate=null; selectedTime=null;
   clientSubView=null; clientLookupResults=null; clientLookupPhone=''; stampAppt=null;
+  bookingNameDraft=''; bookingPhoneDraft='';
   view='client'; render();
 }
 
@@ -1169,10 +1248,12 @@ function renderAdminClientes(){
         </div>
       </div>`;
     } else {
+      const blocked = !!c.blacklisted;
       html += `<div class="svc-row">
-        <div><strong>${escapeHtml(c.name)}</strong><br><span style="color:var(--ink-soft); font-family:var(--font-mono),monospace; font-size:13px;">${escapeHtml(c.phone)}</span></div>
+        <div><strong>${escapeHtml(c.name)}</strong>${blocked?' <span class="badge-block">Bloqueado</span>':''}<br><span style="color:var(--ink-soft); font-family:var(--font-mono),monospace; font-size:13px;">${escapeHtml(c.phone)}</span></div>
         <div class="svc-row-actions">
           <button class="edit-btn" onclick="startEditClient('${c.id}')">Editar</button>
+          <button class="${blocked?'edit-btn':'del-btn'}" onclick="toggleBlacklist('${c.id}')">${blocked?'Desbloquear':'Bloquear'}</button>
           <button class="del-btn" onclick="requestDeleteClientConfirm('${c.id}')">Excluir</button>
         </div>
       </div>`;
@@ -1183,6 +1264,14 @@ function renderAdminClientes(){
 }
 
 function startEditClient(id){ adminEditingClientId = id; render(); }
+
+async function toggleBlacklist(id){
+  const c = clients.find(cl => cl.id === id);
+  if(!c) return;
+  c.blacklisted = !c.blacklisted;
+  await upsertClientRecord(c);
+  render();
+}
 function cancelEditClient(){ adminEditingClientId = null; render(); }
 
 async function saveEditClient(id){
@@ -1365,28 +1454,32 @@ function tryUnlock(){
 }
 
 function renderAdmin(){
-  let html = `<div class="card" style="padding:10px 14px; display:flex; justify-content:space-between; align-items:center;">
+  let topBar = `<div class="card" style="padding:10px 14px; display:flex; justify-content:space-between; align-items:center;">
     <span style="font-size:13px;">Olá, <strong>${escapeHtml(currentAdminUser.name)}</strong></span>
     <button class="link-btn" onclick="doLogout()">Sair</button>
   </div>`;
-  html += `<div class="tabbar">
-    <button class="${adminTab==='dashboard'?'active':''}" onclick="setAdminTab('dashboard')">Painel</button>
-    <button class="${adminTab==='agenda'?'active':''}" onclick="setAdminTab('agenda')">Agenda</button>
-    <button class="${adminTab==='horarios'?'active':''}" onclick="setAdminTab('horarios')">Horários</button>
-    <button class="${adminTab==='servicos'?'active':''}" onclick="setAdminTab('servicos')">Serviços</button>
-    <button class="${adminTab==='clientes'?'active':''}" onclick="setAdminTab('clientes')">Clientes</button>
-    <button class="${adminTab==='equipe'?'active':''}" onclick="setAdminTab('equipe')">Equipe</button>
-    <button class="${adminTab==='config'?'active':''}" onclick="setAdminTab('config')">Ajustes</button>
-  </div>`;
 
-  if(adminTab === 'dashboard') html += renderDashboard();
-  else if(adminTab === 'agenda') html += renderAdminAgenda();
-  else if(adminTab === 'horarios') html += renderAdminHorarios();
-  else if(adminTab === 'servicos') html += renderAdminServicos();
-  else if(adminTab === 'clientes') html += renderAdminClientes();
-  else if(adminTab === 'equipe') html += renderAdminEquipe();
-  else if(adminTab === 'config') html += renderAdminConfig();
-  return html;
+  const tabs = [
+    ['dashboard','📊 Painel'], ['agenda','📅 Agenda'], ['horarios','⏰ Horários'],
+    ['servicos','✂️ Serviços'], ['clientes','👥 Clientes'], ['equipe','🔑 Equipe'], ['config','⚙️ Ajustes']
+  ];
+  const tabbar = `<div class="tabbar">` + tabs.map(([key,label]) =>
+    `<button class="${adminTab===key?'active':''}" onclick="setAdminTab('${key}')">${label}</button>`
+  ).join('') + `</div>`;
+
+  let content = '';
+  if(adminTab === 'dashboard') content = renderDashboard();
+  else if(adminTab === 'agenda') content = renderAdminAgenda();
+  else if(adminTab === 'horarios') content = renderAdminHorarios();
+  else if(adminTab === 'servicos') content = renderAdminServicos();
+  else if(adminTab === 'clientes') content = renderAdminClientes();
+  else if(adminTab === 'equipe') content = renderAdminEquipe();
+  else if(adminTab === 'config') content = renderAdminConfig();
+
+  return topBar + `<div class="admin-shell">
+    <div class="admin-sidebar">${tabbar}</div>
+    <div class="admin-content">${content}</div>
+  </div>`;
 }
 
 function setAdminTab(t){ adminTab = t; adminEditingId = null; adminEditingServiceId = null; adminEditingClientId = null; render(); }
