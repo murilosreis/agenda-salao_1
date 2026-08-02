@@ -194,6 +194,10 @@ button.link-btn:hover{ text-decoration:underline; }
 .filter-row button{ flex:1 1 auto; padding:7px 6px; font-size:11px; border-radius:6px; border:1px solid var(--line); background:var(--slot-bg); cursor:pointer; color:var(--ink-soft); font-family:var(--font-body),sans-serif; min-width:60px; }
 .filter-row button.active{ background:var(--wine); color:#fff; border-color:var(--wine); }
 .filter-date{ margin-bottom:12px; }
+.status-select{ margin-top:6px; width:auto; padding:4px 8px; font-size:11px; border-radius:6px; display:inline-block; }
+.status-select.status-pending{ background:#F5EFD8; border-color:#D9C67A; color:#7A6420; }
+.status-select.status-completed{ background:var(--ok-bg); border-color:#9CBD82; color:var(--ok-ink); }
+.status-select.status-no_show{ background:#F5E0DC; border-color:#D9948A; color:#8C2F2F; }
 
 .svc-edit-form{ border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:10px; background:var(--bg); }
 .svc-row-actions{ display:flex; gap:10px; flex-shrink:0; }
@@ -302,6 +306,12 @@ const DEFAULT_CONFIG = {
   whatsappLink: ''
 };
 
+const STATUS_LABELS = {
+  pending: 'A realizar',
+  completed: 'Concluído',
+  no_show: 'Não compareceu'
+};
+
 const FONT_SETS = {
   classic: { label:'Clássica (Fraunces + Inter)', heading:'Fraunces', body:'Inter', mono:'IBM Plex Mono' },
   editorial: { label:'Editorial (Playfair + Poppins)', heading:'Playfair Display', body:'Poppins', mono:'Space Mono' },
@@ -399,7 +409,9 @@ let flashOk = false;
 let dashServiceId = 'all';
 let adminAgendaFilter = 'all';
 let adminAgendaCustomDate = null;
+let adminAgendaServiceFilter = 'all';
 let adminEditingServiceId = null;
+let clientSearchQuery = '';
 
 function pad(n){ return String(n).padStart(2,'0'); }
 function toISODate(d){ return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
@@ -1073,6 +1085,7 @@ async function confirmBooking(){
     serviceIds: svc ? svc.ids : [],
     serviceName: svc ? svc.name : '',
     servicePrice: svc ? svc.price : 0,
+    status: 'pending',
     createdAt: new Date().toISOString()
   };
   appointments.push(appt);
@@ -1230,11 +1243,38 @@ async function rejectCancelRequest(reqId){
 }
 
 function renderAdminClientes(){
-  let html = `<div class="card"><p class="section-label">Clientes cadastrados (${clients.length})</p>`;
-  if(clients.length === 0){
-    html += '<p class="empty-note">Nenhum cliente cadastrado ainda. O cadastro é criado automaticamente quando alguém agenda pela primeira vez.</p>';
+  return `<div class="card">
+    <p class="section-label">Clientes cadastrados (${clients.length})</p>
+    <input type="text" id="clientSearchInput" placeholder="Buscar por nome ou telefone" value="${escapeHtml(clientSearchQuery)}" oninput="onClientSearchInput(this.value)" style="margin-bottom:12px;">
+    <div id="clientListBody">${renderClientListBody()}</div>
+  </div>`;
+}
+
+function onClientSearchInput(v){
+  clientSearchQuery = v;
+  const body = document.getElementById('clientListBody');
+  if(body) body.innerHTML = renderClientListBody();
+}
+
+function renderClientListBody(){
+  const q = clientSearchQuery.trim().toLowerCase();
+  const qDigits = clientSearchQuery.replace(/\D/g,'');
+  let filtered = clients;
+  if(q){
+    filtered = clients.filter(c => {
+      const nameMatch = (c.name||'').toLowerCase().includes(q);
+      const phoneMatch = qDigits ? (c.phone||'').replace(/\D/g,'').includes(qDigits) : false;
+      return nameMatch || phoneMatch;
+    });
   }
-  const sorted = [...clients].sort((a,b) => a.name.localeCompare(b.name, 'pt-BR'));
+  let html = '';
+  if(clients.length === 0){
+    return '<p class="empty-note">Nenhum cliente cadastrado ainda. O cadastro é criado automaticamente quando alguém agenda pela primeira vez.</p>';
+  }
+  if(filtered.length === 0){
+    return '<p class="empty-note">Nenhum cliente encontrado para essa busca.</p>';
+  }
+  const sorted = [...filtered].sort((a,b) => a.name.localeCompare(b.name, 'pt-BR'));
   sorted.forEach(c => {
     if(adminEditingClientId === c.id){
       html += `<div class="svc-edit-form">
@@ -1497,7 +1537,10 @@ function renderDashboard(){
   const countToday = appointments.filter(a => a.date === today).length;
   const countWeek = appointments.filter(a => a.date >= startOfWeekISO && a.date <= endOfWeekISO).length;
   const countMonth = appointments.filter(a => a.date >= startOfMonthISO && a.date <= endOfMonthISO).length;
-  const future = appointments.filter(a => a.date >= today);
+  // "Futuros" conta só o que ainda vai acontecer (não concluído, não marcado como não compareceu).
+  const future = appointments.filter(a => a.date >= today && (a.status||'pending') === 'pending');
+  const completedMonth = appointments.filter(a => a.date >= startOfMonthISO && a.date <= endOfMonthISO && a.status === 'completed');
+  const noShowMonth = appointments.filter(a => a.date >= startOfMonthISO && a.date <= endOfMonthISO && a.status === 'no_show');
   const revenueMonth = appointments.filter(a => a.date >= startOfMonthISO && a.date <= endOfMonthISO)
     .reduce((sum,a) => sum + Number(a.servicePrice||0), 0);
   const revenueFuture = future.reduce((sum,a) => sum + Number(a.servicePrice||0), 0);
@@ -1517,12 +1560,14 @@ function renderDashboard(){
       <div class="metric-card"><div class="mlabel">Hoje</div><div class="mvalue">${countToday}</div></div>
       <div class="metric-card"><div class="mlabel">Esta semana</div><div class="mvalue">${countWeek}</div></div>
       <div class="metric-card"><div class="mlabel">Este mês</div><div class="mvalue">${countMonth}</div></div>
-      <div class="metric-card"><div class="mlabel">Agendamentos futuros</div><div class="mvalue">${future.length}</div></div>
+      <div class="metric-card"><div class="mlabel">Futuros a realizar</div><div class="mvalue">${future.length}</div></div>
       <div class="metric-card"><div class="mlabel">Faturamento hoje</div><div class="mvalue" style="font-size:18px;">${money(revenueToday)}</div></div>
       <div class="metric-card"><div class="mlabel">Faturamento do mês</div><div class="mvalue" style="font-size:18px;">${money(revenueMonth)}</div></div>
-      <div class="metric-card"><div class="mlabel">Previsto (futuros)</div><div class="mvalue" style="font-size:18px;">${money(revenueFuture)}</div></div>
+      <div class="metric-card"><div class="mlabel">Previsto (a realizar)</div><div class="mvalue" style="font-size:18px;">${money(revenueFuture)}</div></div>
+      <div class="metric-card"><div class="mlabel">Concluídos no mês</div><div class="mvalue">${completedMonth.length}</div></div>
+      <div class="metric-card"><div class="mlabel">Não compareceu (mês)</div><div class="mvalue">${noShowMonth.length}</div></div>
     </div>
-    <p class="footer-note" style="text-align:left; margin-top:12px;">Serviço mais procurado: <strong>${escapeHtml(topService)}</strong>${topCount?` (${topCount}x)`:''}</p>
+    <p class="footer-note" style="text-align:left; margin-top:12px;">Serviço mais procurado: <strong>${escapeHtml(topService)}</strong>${topCount?` (${topCount}x)`:''}. "Futuros a realizar" e "Previsto" contam só agendamentos ainda pendentes — já não incluem os marcados como concluído ou não compareceu.</p>
   </div>`;
 
   html += renderServicePerformance();
@@ -1592,6 +1637,15 @@ function renderSvcBarChart(done, todo){
 
 function setAgendaFilter(f){ adminAgendaFilter = f; adminAgendaCustomDate = null; render(); }
 function setAgendaCustomDate(v){ adminAgendaCustomDate = v || null; render(); }
+function setAgendaServiceFilter(v){ adminAgendaServiceFilter = v; render(); }
+
+async function updateApptStatus(id, status){
+  const a = appointments.find(x => x.id === id);
+  if(!a) return;
+  a.status = status;
+  await updateAppointmentRecord(a);
+  render();
+}
 
 function renderCancelRequestsSection(){
   if(cancelRequests.length === 0) return '';
@@ -1648,7 +1702,12 @@ function renderAdminAgenda(){
     list = appointments.filter(a => a.date >= today);
     title = 'Próximos agendamentos';
   }
+  if(adminAgendaServiceFilter !== 'all'){
+    list = list.filter(a => a.serviceIds ? a.serviceIds.includes(adminAgendaServiceFilter) : a.serviceId === adminAgendaServiceFilter);
+  }
   list = [...list].sort((a,b) => (a.date+a.time).localeCompare(b.date+b.time));
+
+  const svcFilterOptions = config.services.map(s => `<option value="${s.id}" ${adminAgendaServiceFilter===s.id?'selected':''}>${escapeHtml(s.name)}</option>`).join('');
 
   let html = renderCancelRequestsSection();
   html += `<div class="card">
@@ -1659,6 +1718,11 @@ function renderAdminAgenda(){
       <button class="${adminAgendaFilter==='all'&&!adminAgendaCustomDate?'active':''}" onclick="setAgendaFilter('all')">Futuros</button>
     </div>
     <input class="filter-date" type="date" value="${adminAgendaCustomDate||''}" onchange="setAgendaCustomDate(this.value)">
+    <label class="field">Filtrar por serviço</label>
+    <select onchange="setAgendaServiceFilter(this.value)">
+      <option value="all" ${adminAgendaServiceFilter==='all'?'selected':''}>Todos os serviços</option>
+      ${svcFilterOptions}
+    </select>
   </div>`;
 
   html += `<div class="card"><p class="section-label">${title} (${list.length})</p>`;
@@ -1671,9 +1735,16 @@ function renderAdminAgenda(){
         html += `<div class="day-group-title">${DOW_FULL[d.getDay()]}, ${displayDate(a.date)}</div>`;
         lastDate = a.date;
       }
+      const st = a.status || 'pending';
       html += `<div class="appt-row">
         <div class="time">${a.time}</div>
-        <div class="info"><div class="name">${escapeHtml(a.clientName)}</div><div class="phone">${escapeHtml(maskPhone(a.clientPhone))}</div><div class="svc">${escapeHtml(a.serviceName||'')}</div></div>
+        <div class="info"><div class="name">${escapeHtml(a.clientName)}</div><div class="phone">${escapeHtml(maskPhone(a.clientPhone))}</div><div class="svc">${escapeHtml(a.serviceName||'')}</div>
+          <select class="status-select status-${st}" onchange="updateApptStatus('${a.id}', this.value)">
+            <option value="pending" ${st==='pending'?'selected':''}>A realizar</option>
+            <option value="completed" ${st==='completed'?'selected':''}>Concluído</option>
+            <option value="no_show" ${st==='no_show'?'selected':''}>Não compareceu</option>
+          </select>
+        </div>
         <div class="actions">
           <button class="edit" onclick="startEditAppointment('${a.id}')">Editar</button>
           <button class="cancel" onclick="requestCancelConfirm('admin','${a.id}')">Cancelar</button>
@@ -1806,7 +1877,17 @@ async function toggleFullDayBlock(iso){
 }
 
 function renderAdminServicos(){
-  let html = `<div class="card"><p class="section-label">Serviços cadastrados</p>`;
+  let html = `<div class="card">
+    <p class="section-label">Novo serviço</p>
+    <label class="field">Nome do serviço</label>
+    <input type="text" id="newSvcName" placeholder="Ex: Coloração">
+    <div class="row2">
+      <div><label class="field">Duração (min)</label><input type="number" id="newSvcDuration" value="60" min="5" step="5"></div>
+      <div><label class="field">Preço (R$)</label><input type="number" id="newSvcPrice" value="0" min="0" step="0.01"></div>
+    </div>
+    <button class="primary" onclick="addService()">Cadastrar serviço</button>
+  </div>
+  <div class="card"><p class="section-label">Serviços cadastrados</p>`;
   if(config.services.length === 0){ html += '<p class="empty-note">Nenhum serviço cadastrado.</p>'; }
   config.services.forEach(s => {
     if(adminEditingServiceId === s.id){
@@ -1832,17 +1913,7 @@ function renderAdminServicos(){
       </div>`;
     }
   });
-  html += `</div>
-  <div class="card">
-    <p class="section-label">Novo serviço</p>
-    <label class="field">Nome do serviço</label>
-    <input type="text" id="newSvcName" placeholder="Ex: Coloração">
-    <div class="row2">
-      <div><label class="field">Duração (min)</label><input type="number" id="newSvcDuration" value="60" min="5" step="5"></div>
-      <div><label class="field">Preço (R$)</label><input type="number" id="newSvcPrice" value="0" min="0" step="0.01"></div>
-    </div>
-    <button class="primary" onclick="addService()">Cadastrar serviço</button>
-  </div>`;
+  html += `</div>`;
   return html;
 }
 
@@ -1894,7 +1965,9 @@ function renderAdminEquipe(){
   if(useFirestore){
     html += `<label class="field">E-mail de login</label>
     <input type="text" id="newUserEmail" placeholder="fernanda@salao.com">
-    <p class="footer-note" style="text-align:left; margin-top:6px;">Isso só liga o nome ao e-mail para exibir "Olá, Fernanda" — a conta de login de verdade precisa ser criada no console do Firebase, em Authentication → Users, com esse mesmo e-mail e uma senha.</p>`;
+    <label class="field">Senha (mínimo 6 caracteres)</label>
+    <input type="password" id="newUserPassword" placeholder="••••••••">
+    <p class="footer-note" style="text-align:left; margin-top:6px;">A conta de acesso é criada automaticamente ao cadastrar — não precisa entrar no console do Firebase. Compartilhe o e-mail e a senha com a pessoa.</p>`;
   } else {
     html += `<label class="field">PIN de acesso</label>
     <input type="text" id="newUserPin" placeholder="0000" inputmode="numeric">`;
@@ -1909,24 +1982,47 @@ async function addUser(){
   if(!name){ flashMsg = 'Preencha o nome.'; flashOk=false; render(); return; }
   if(useFirestore){
     const email = document.getElementById('newUserEmail').value.trim();
-    if(!email){ flashMsg = 'Preencha o e-mail.'; flashOk=false; render(); return; }
+    const password = document.getElementById('newUserPassword').value;
+    if(!email || !password){ flashMsg = 'Preencha e-mail e senha.'; flashOk=false; render(); return; }
+    if(password.length < 6){ flashMsg = 'A senha deve ter pelo menos 6 caracteres.'; flashOk=false; render(); return; }
     if(config.users.some(u => u.email && u.email.toLowerCase() === email.toLowerCase())){
       flashMsg = 'Já existe um usuário com esse e-mail.'; flashOk=false; render(); return;
     }
+    // Cria a conta de login de verdade usando uma instância secundária do Firebase,
+    // para não deslogar quem está cadastrando (o admin atual).
+    let secondaryApp = null;
+    try{
+      secondaryApp = firebase.initializeApp(firebaseConfig, 'Secondary_'+Date.now());
+      await secondaryApp.auth().createUserWithEmailAndPassword(email, password);
+      await secondaryApp.auth().signOut();
+    }catch(e){
+      let msg = 'Não foi possível criar o acesso dessa pessoa.';
+      if(e && e.code === 'auth/email-already-in-use') msg = 'Já existe uma conta com esse e-mail no Firebase.';
+      else if(e && e.code === 'auth/invalid-email') msg = 'E-mail inválido.';
+      else if(e && e.code === 'auth/weak-password') msg = 'Senha muito fraca — use pelo menos 6 caracteres.';
+      flashMsg = msg; flashOk = false; render(); return;
+    }finally{
+      if(secondaryApp){ try{ await secondaryApp.delete(); }catch(e){} }
+    }
     config.users.push({ id:'u'+Date.now(), name, email, pin:'' });
+    flashMsg = 'Usuário cadastrado — já pode entrar com o e-mail e a senha definidos.'; flashOk = true;
   } else {
     const pin = document.getElementById('newUserPin').value.trim();
     if(!pin){ flashMsg = 'Preencha o PIN.'; flashOk=false; render(); return; }
     if(config.users.some(u => u.pin === pin)){ flashMsg = 'Já existe um usuário com esse PIN.'; flashOk=false; render(); return; }
     config.users.push({ id:'u'+Date.now(), name, pin, email:'' });
+    flashMsg = 'Usuário cadastrado.'; flashOk = true;
   }
-  flashMsg = 'Usuário cadastrado.'; flashOk = true;
   await saveConfig();
 }
 async function removeUser(id){
   if(config.users.length <= 1){ flashMsg = 'É necessário manter ao menos um usuário.'; flashOk=false; render(); return; }
   config.users = config.users.filter(u => u.id !== id);
+  if(useFirestore){
+    flashMsg = 'Removido da lista da equipe. A conta de login continua existindo no Firebase — para excluí-la de vez, apague em Authentication → Users no console.'; flashOk = true;
+  }
   await saveConfig();
+  render();
 }
 
 function renderTeamAccessCard(){
