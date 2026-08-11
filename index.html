@@ -1318,7 +1318,11 @@ async function requestClientCancellation(id){
     serviceName: appt.serviceName,
     createdAt: new Date().toISOString()
   };
-  await addCancelRequestRecord(reqObj);
+  const ok = await addCancelRequestRecord(reqObj);
+  if(!ok){
+    flashMsg = 'Não foi possível enviar o pedido de cancelamento agora. Verifique sua internet e tente de novo, ou fale direto com o salão.'; flashOk = false;
+    render(); return;
+  }
   await upsertCancelLookup(appt.clientPhone.replace(/\D/g,''), reqObj);
   cancelRequestPending = reqObj;
   clientLookupCancelInfo = reqObj;
@@ -1538,7 +1542,7 @@ function renderConfirmModal(){
     const appt = appointments.find(a => a.id === pendingConfirm.id);
     const label = appt ? appt.clientName : 'este agendamento';
     nameHeading = `<p class="modal-name">Cancelar agendamento</p>`;
-    message = `Cancelar o agendamento de <strong>${escapeHtml(label)}</strong>? Vamos gerar um código (e QR code) que você precisa enviar pelo WhatsApp do salão ou mostrar na recepção — o cancelamento só é efetivado depois que a equipe confirmar.`;
+    message = `Cancelar o agendamento de <strong>${escapeHtml(label)}</strong>? Vamos gerar um código que você precisa enviar pelo WhatsApp do salão — o cancelamento só é efetivado depois que a equipe confirmar.`;
   } else {
     const appt = appointments.find(a => a.id === pendingConfirm.id);
     const label = appt ? appt.clientName : 'este agendamento';
