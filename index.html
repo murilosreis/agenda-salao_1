@@ -92,6 +92,11 @@ body{
 .full-label{ font-size:6.5px; font-family:var(--font-mono),monospace; text-transform:uppercase; letter-spacing:0.02em; color:var(--wine); margin-top:1px; }
 .cal-cell.selected{ background:var(--wine); color:#fff; box-shadow:var(--shadow-md); }
 .cal-cell.today:not(.selected){ box-shadow: inset 0 0 0 1.5px var(--gold); font-weight:700; }
+.cal-compact .cal-grid{ gap:3px; max-width:320px; margin:0 auto; }
+.cal-compact .cal-cell{ font-size:11px; }
+.cal-compact .full-label{ font-size:5.5px; }
+.cal-compact .cal-header{ max-width:320px; margin:0 auto 6px; }
+.cal-compact .cal-weekdays{ max-width:320px; margin:0 auto 4px; }
 
 .service-list{ display:flex; flex-direction:column; gap:8px; }
 .service-card{ display:flex; justify-content:space-between; align-items:center; gap:10px; border:1.5px solid var(--line); border-radius:var(--radius-md); padding:13px 15px; cursor:pointer; background:var(--slot-bg); transition:all .15s ease; }
@@ -888,7 +893,7 @@ function renderCalendar(opts){
   const weeks = buildMonthMatrix(year, month);
   const today = todayISO();
 
-  let html = `<div class="cal-header">
+  let html = `<div class="${opts.compact?'cal-compact':''}"><div class="cal-header">
     <button class="cal-nav-btn" ${opts.monthOffset<=0?'disabled':''} onclick="${opts.prevFn}()">‹</button>
     <div class="cal-title">${MONTHS[month]} ${year}</div>
     <button class="cal-nav-btn" onclick="${opts.nextFn}()">›</button>
@@ -929,7 +934,7 @@ function renderCalendar(opts){
       html += `<div class="${cls}" ${click}>${inner}</div>`;
     });
   });
-  html += '</div>';
+  html += '</div></div>';
   return html;
 }
 
@@ -1299,9 +1304,16 @@ async function showCheckinCode(id){
   if(!appt) return;
   const needsNew = !appt.checkinCode || isCodeExpired(appt.checkinCodeAt);
   if(needsNew){
-    appt.checkinCode = String(Math.floor(100000 + Math.random()*900000));
-    appt.checkinCodeAt = new Date().toISOString();
-    await updateAppointmentRecord(appt);
+    const newCode = String(Math.floor(100000 + Math.random()*900000));
+    const newAt = new Date().toISOString();
+    appt.checkinCode = newCode;
+    appt.checkinCodeAt = newAt;
+    const ok = await updateAppointmentRecord(appt);
+    if(!ok){
+      flashMsg = 'Não foi possível gerar o código agora. Verifique sua internet e tente de novo.'; flashOk = false;
+      appt.checkinCode = null; appt.checkinCodeAt = null;
+      render(); return;
+    }
   }
   clientCheckinAppt = appt;
   render();
@@ -1975,7 +1987,7 @@ function renderAdminHorarios(){
 
   let html = `<div class="card">
     <p class="section-label">Gerenciar disponibilidade</p>
-    ${renderCalendar({ monthOffset: adminMonthOffset, selected: adminSelectedDate, prevFn:'adminPrevMonth', nextFn:'adminNextMonth', clickFn:'pickAdminDate', allowClosed:true })}
+    ${renderCalendar({ monthOffset: adminMonthOffset, selected: adminSelectedDate, prevFn:'adminPrevMonth', nextFn:'adminNextMonth', clickFn:'pickAdminDate', allowClosed:true, compact:true })}
     <div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px;">
       <p class="section-label" style="margin:0;">${DOW_FULL[dObj.getDay()]}, ${displayDate(adminSelectedDate)}</p>
       <button class="link-btn" onclick="toggleFullDayBlock('${adminSelectedDate}')">${isFullyBlocked ? 'Reabrir o dia' : 'Fechar o dia inteiro'}</button>
