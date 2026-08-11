@@ -396,6 +396,8 @@ let cancelRequestPending = null;
 let clientCheckinAppt = null;
 let cancelReqUnsub = null;
 let cancelReqFirstSnapshotDone = false;
+let checkins = [];
+let checkinsUnsub = null;
 
 let adminUnlocked = false;
 let currentAdminUser = null;
@@ -656,6 +658,52 @@ function startCancelRequestsRealtimeSync(){
   }, () => { /* mantém os dados já carregados em caso de erro de conexão */ });
 }
 
+// Pedidos de confirmação de chegada: gravados como documento NOVO (create), nunca como
+// atualização do agendamento existente — evita depender de permissão de "update" pública,
+// que é bloqueada pelas regras de segurança (só a equipe autenticada pode alterar agendamentos).
+async function loadCheckinsFromStore(){
+  if(useFirestore){
+    try{ const snap = await db.collection('checkins').get(); return snap.docs.map(d => d.data()); }
+    catch(e){ return []; }
+  }
+  const c = await storageGet('checkins', true);
+  return c ? JSON.parse(c.value) : [];
+}
+async function persistAllCheckinsFallback(){
+  try{ const r = await storageSet('checkins', JSON.stringify(checkins), true); return !!r; }
+  catch(e){ return false; }
+}
+async function addCheckinRecord(rec){
+  if(useFirestore){
+    try{ await db.collection('checkins').doc(rec.id).set(rec); return true; }
+    catch(e){ return false; }
+  }
+  checkins.push(rec);
+  return await persistAllCheckinsFallback();
+}
+async function deleteCheckinRecord(id){
+  if(useFirestore){
+    try{ await db.collection('checkins').doc(id).delete(); return true; }
+    catch(e){ return false; }
+  }
+  return await persistAllCheckinsFallback();
+}
+function startCheckinsRealtimeSync(){
+  if(!useFirestore || checkinsUnsub) return;
+  checkinsUnsub = db.collection('checkins').onSnapshot(snapshot => {
+    snapshot.docChanges().forEach(change => {
+      const data = change.doc.data();
+      if(change.type === 'added'){
+        const idx = checkins.findIndex(c => c.id === data.id);
+        if(idx >= 0) checkins[idx] = data; else checkins.push(data);
+      } else if(change.type === 'removed'){
+        checkins = checkins.filter(c => c.id !== data.id);
+      }
+    });
+    render();
+  }, () => { /* mantém os dados já carregados em caso de erro de conexão */ });
+}
+
 async function loadData(){
   try{
     config = await loadConfigFromStore();
@@ -699,6 +747,7 @@ async function loadData(){
         currentAdminUser = null;
         clients = [];
         cancelRequests = [];
+        checkins = [];
       }
       checkEntryRoute();
       render();
@@ -721,6 +770,8 @@ async function loadStaffOnlyData(){
   }
   try{ cancelRequests = await loadCancelRequestsFromStore(); }catch(e){ cancelRequests = []; }
   startCancelRequestsRealtimeSync();
+  try{ checkins = await loadCheckinsFromStore(); }catch(e){ checkins = []; }
+  startCheckinsRealtimeSync();
 }
 
 let clientsUnsub = null;
@@ -1302,35 +1353,41 @@ function renderCancelRequestScreen(){
 async function showCheckinCode(id){
   const appt = appointments.find(a => a.id === id);
   if(!appt) return;
-  const needsNew = !appt.checkinCode || isCodeExpired(appt.checkinCodeAt);
+  const needsNew = !clientCheckinAppt || clientCheckinAppt.appointmentId !== id || isCodeExpired(clientCheckinAppt.createdAt);
   if(needsNew){
-    const newCode = String(Math.floor(100000 + Math.random()*900000));
-    const newAt = new Date().toISOString();
-    appt.checkinCode = newCode;
-    appt.checkinCodeAt = newAt;
-    const ok = await updateAppointmentRecord(appt);
+    const rec = {
+      id: 'ck'+Date.now()+Math.floor(Math.random()*1000),
+      code: String(Math.floor(100000 + Math.random()*900000)),
+      appointmentId: id,
+      clientName: appt.clientName,
+      clientPhone: appt.clientPhone,
+      date: appt.date,
+      time: appt.time,
+      serviceName: appt.serviceName,
+      createdAt: new Date().toISOString()
+    };
+    const ok = await addCheckinRecord(rec);
     if(!ok){
       flashMsg = 'Não foi possível gerar o código agora. Verifique sua internet e tente de novo.'; flashOk = false;
-      appt.checkinCode = null; appt.checkinCodeAt = null;
       render(); return;
     }
+    clientCheckinAppt = rec;
   }
-  clientCheckinAppt = appt;
   render();
 }
 
 function renderCheckinScreen(){
-  const appt = clientCheckinAppt;
-  const d = fromISODate(appt.date);
+  const rec = clientCheckinAppt;
+  const d = fromISODate(rec.date);
   return `<div class="card">
       <p class="section-label">Confirmação de chegada</p>
       <p style="font-size:14px; line-height:1.6; color:var(--ink);">
         Informe esse código na recepção quando chegar — isso confirma no sistema que o atendimento foi realizado.
       </p>
       <div class="stamp-wrap">
-        <p class="confirm-detail" style="font-size:28px; letter-spacing:0.08em;"><strong>${appt.checkinCode}</strong></p>
+        <p class="confirm-detail" style="font-size:28px; letter-spacing:0.08em;"><strong>${rec.code}</strong></p>
       </div>
-      <p style="font-size:13px; color:var(--ink-soft); margin-top:8px;">${escapeHtml(appt.serviceName||'')}<br>${DOW_FULL[d.getDay()]}, ${displayDate(appt.date)} às ${appt.time}</p>
+      <p style="font-size:13px; color:var(--ink-soft); margin-top:8px;">${escapeHtml(rec.serviceName||'')}<br>${DOW_FULL[d.getDay()]}, ${displayDate(rec.date)} às ${rec.time}</p>
       <p style="font-size:12px; color:var(--gold); margin-top:6px; text-align:center;">⏱ Válido por 5 minutos. Se expirar, toque em "Confirmar chegada" novamente para gerar um novo código.</p>
       <button class="secondary" style="margin-top:14px;" onclick="clientCheckinAppt=null; render();">Fechar</button>
     </div>`;
@@ -1770,24 +1827,45 @@ async function updateApptStatus(id, status){
 }
 
 function renderCheckinConfirmSection(){
+  const expired = checkins.filter(c => isCodeExpired(c.createdAt));
+  if(expired.length > 0){
+    expired.forEach(c => pruneExpiredCheckin(c));
+  }
   return `<div class="card">
     <p class="section-label">✅ Confirmar chegada por código</p>
-    <p class="footer-note" style="text-align:left;">Peça o código (ou QR) que o cliente mostra no celular ao chegar e digite aqui para marcar o atendimento como concluído automaticamente.</p>
+    <p class="footer-note" style="text-align:left;">Peça o código que o cliente mostra no celular ao chegar e digite aqui para marcar o atendimento como concluído automaticamente. Válido por 5 minutos.</p>
     <input type="text" id="checkinCodeInput" placeholder="000000" inputmode="numeric" maxlength="6">
     <button class="primary" onclick="confirmCheckinByCode()">Confirmar chegada</button>
   </div>`;
+}
+
+async function pruneExpiredCheckin(rec){
+  checkins = checkins.filter(c => c.id !== rec.id);
+  await deleteCheckinRecord(rec.id);
 }
 
 async function confirmCheckinByCode(){
   const input = document.getElementById('checkinCodeInput');
   const code = input ? input.value.trim() : '';
   if(!code){ flashMsg = 'Digite o código.'; flashOk=false; render(); return; }
-  const appt = appointments.find(a => a.checkinCode === code);
-  if(!appt){ flashMsg = 'Código não encontrado. Confira com o cliente.'; flashOk=false; render(); return; }
-  if(appt.status === 'completed'){ flashMsg = 'Esse agendamento já estava marcado como concluído.'; flashOk=false; render(); return; }
-  if(isCodeExpired(appt.checkinCodeAt)){ flashMsg = 'Esse código expirou. Peça para o cliente gerar um novo em "Confirmar chegada".'; flashOk=false; render(); return; }
+  const rec = checkins.find(c => c.code === code);
+  if(!rec){ flashMsg = 'Código não encontrado. Confira com o cliente.'; flashOk=false; render(); return; }
+  if(isCodeExpired(rec.createdAt)){
+    await pruneExpiredCheckin(rec);
+    flashMsg = 'Esse código expirou. Peça para o cliente gerar um novo em "Confirmar chegada".'; flashOk=false; render(); return;
+  }
+  const appt = appointments.find(a => a.id === rec.appointmentId);
+  if(!appt){
+    await pruneExpiredCheckin(rec);
+    flashMsg = 'Agendamento não encontrado (pode já ter sido cancelado).'; flashOk=false; render(); return;
+  }
+  if(appt.status === 'completed'){
+    await pruneExpiredCheckin(rec);
+    flashMsg = 'Esse agendamento já estava marcado como concluído.'; flashOk=false; render(); return;
+  }
   appt.status = 'completed';
   await updateAppointmentRecord(appt);
+  await pruneExpiredCheckin(rec);
   flashMsg = 'Chegada confirmada: '+appt.clientName+'.'; flashOk = true;
   render();
 }
