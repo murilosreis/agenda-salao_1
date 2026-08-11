@@ -8,6 +8,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,600;0,700;1,600&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&family=Playfair+Display:ital,wght@0,600;0,700;1,600&family=Poppins:wght@400;500;600;700&family=Space+Mono:wght@400;700&family=Cormorant+Garamond:ital,wght@0,600;0,700;1,600&family=Work+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&family=Bodoni+Moda:ital,wght@0,600;0,700;1,600&family=Manrope:wght@400;500;600;700&family=Roboto+Mono:wght@500;600&family=Spectral:ital,wght@0,600;0,700;1,600&family=Nunito+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
 
@@ -116,6 +117,11 @@ body{
 .modal-overlay{ position:fixed; inset:0; background:rgba(20,10,20,0.55); backdrop-filter:blur(3px); -webkit-backdrop-filter:blur(3px); z-index:1000; display:flex; align-items:center; justify-content:center; padding:20px; }
 .modal-box{ background:var(--paper); border-radius:var(--radius-lg); padding:22px; max-width:340px; width:100%; box-shadow:var(--shadow-lg); }
 .modal-text{ font-size:14px; line-height:1.5; margin-bottom:16px; color:var(--ink); }
+.modal-name{ font-family:var(--font-heading),serif; font-weight:700; font-size:22px; color:#8C2F2F; margin:0 0 10px; line-height:1.25; }
+.code-display{ font-family:var(--font-mono),monospace; font-size:22px; font-weight:700; letter-spacing:0.1em; text-align:center; background:var(--bg); border:1.5px dashed var(--line); border-radius:var(--radius-sm); padding:10px; margin:8px 0 12px; color:var(--wine); }
+.qr-wrap{ display:flex; justify-content:center; }
+.qr-wrap svg{ width:180px; height:180px; }
+.appt-row .actions button.confirm{ color:var(--ok-ink); }
 
 .whatsapp-btn{ display:inline-block; background:#25D366; color:#fff; text-decoration:none; padding:11px 20px; border-radius:8px; font-weight:600; font-size:14px; font-family:var(--font-body),sans-serif; }
 .whatsapp-btn:hover{ opacity:0.92; }
@@ -385,6 +391,7 @@ let stampAppt = null;
 let pendingConfirm = null;
 let cancelRequests = [];
 let cancelRequestPending = null;
+let clientCheckinAppt = null;
 let cancelReqUnsub = null;
 let cancelReqFirstSnapshotDone = false;
 
@@ -420,6 +427,14 @@ function displayDate(iso){ const d = fromISODate(iso); return pad(d.getDate())+'
 function todayISO(){ const d = new Date(); d.setHours(0,0,0,0); return toISODate(d); }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function money(n){ return 'R$ ' + Number(n||0).toFixed(2).replace('.',','); }
+function renderQrSvg(text){
+  try{
+    const qr = qrcode(0, 'M');
+    qr.addData(String(text));
+    qr.make();
+    return qr.createSvgTag({ cellSize:4, margin:2 });
+  }catch(e){ return '<p class="empty-note">Não foi possível gerar o QR code.</p>'; }
+}
 
 const STORAGE_PREFIX = 'agenda_salao_';
 const hasCloudStorage = (typeof window !== 'undefined') && window.storage && typeof window.storage.get === 'function';
@@ -595,6 +610,34 @@ async function deleteCancelRequestRecord(id){
     catch(e){ return false; }
   }
   return await persistAllCancelRequestsFallback();
+}
+
+// Ponteiro público (por telefone) para o cliente recuperar o código de cancelamento
+// mesmo se fechar a tela sem anotar — não expõe a lista completa de pedidos.
+async function upsertCancelLookup(phoneDigits, data){
+  if(!phoneDigits) return;
+  if(useFirestore){
+    try{ await db.collection('cancelLookup').doc(phoneDigits).set(data); }catch(e){}
+    return;
+  }
+  try{ await storageSet('cancelLookup_'+phoneDigits, JSON.stringify(data), false); }catch(e){}
+}
+async function getCancelLookupByPhone(phoneDigits){
+  if(!phoneDigits) return null;
+  if(useFirestore){
+    try{ const snap = await db.collection('cancelLookup').doc(phoneDigits).get(); return snap.exists ? snap.data() : null; }
+    catch(e){ return null; }
+  }
+  try{ const r = await storageGet('cancelLookup_'+phoneDigits, false); return r ? JSON.parse(r.value) : null; }
+  catch(e){ return null; }
+}
+async function deleteCancelLookup(phoneDigits){
+  if(!phoneDigits) return;
+  if(useFirestore){
+    try{ await db.collection('cancelLookup').doc(phoneDigits).delete(); }catch(e){}
+    return;
+  }
+  try{ await storageSet('cancelLookup_'+phoneDigits, '', false); }catch(e){}
 }
 function startCancelRequestsRealtimeSync(){
   if(!useFirestore || cancelReqUnsub) return;
@@ -917,6 +960,8 @@ function render(){
     html += renderStampScreen();
   } else if(cancelRequestPending){
     html += renderCancelRequestScreen();
+  } else if(clientCheckinAppt){
+    html += renderCheckinScreen();
   } else if(view === 'client') html += renderClient();
   else if(view === 'admin-lock') html += renderAdminLock();
   else if(view === 'admin') html += renderAdmin();
@@ -1132,7 +1177,7 @@ function renderStampScreen(){
 function resetClient(){
   selectedServiceIds=[]; bookingServicesConfirmed=false; selectedDate=null; selectedTime=null;
   clientSubView=null; clientLookupResults=null; clientLookupPhone=''; stampAppt=null;
-  bookingNameDraft=''; bookingPhoneDraft='';
+  bookingNameDraft=''; bookingPhoneDraft=''; clientCheckinAppt=null; clientLookupCancelInfo=null;
   view='client'; render();
 }
 
@@ -1155,15 +1200,29 @@ function renderLookupScreen(){
         html += `<div class="appt-row">
           <div class="time">${a.time}</div>
           <div class="info"><div class="name">${DOW_FULL[d.getDay()]}, ${displayDate(a.date)}</div><div class="svc">${escapeHtml(a.serviceName||'')}</div></div>
-          <div class="actions"><button class="cancel" onclick="requestCancelConfirm('client','${a.id}')">Cancelar</button></div>
+          <div class="actions">
+            <button class="confirm" onclick="showCheckinCode('${a.id}')">Confirmar chegada</button>
+            <button class="cancel" onclick="requestCancelConfirm('client','${a.id}')">Cancelar</button>
+          </div>
         </div>`;
       });
       html += '</div>';
+    }
+    if(clientLookupCancelInfo){
+      html += `<div style="margin-top:16px; padding-top:14px; border-top:1px solid var(--line);">
+        <p class="section-label">Cancelamento aguardando confirmação</p>
+        <div class="appt-row" style="flex-direction:column; align-items:stretch;">
+          <div class="info" style="margin-bottom:8px;"><div class="name">${escapeHtml(clientLookupCancelInfo.serviceName||'')}</div><div class="svc">${displayDate(clientLookupCancelInfo.date)} às ${clientLookupCancelInfo.time}</div></div>
+          <button class="secondary" onclick="reopenCancelRequestFromLookup()">Ver código de cancelamento novamente</button>
+        </div>
+      </div>`;
     }
   }
   html += '</div>';
   return html;
 }
+
+let clientLookupCancelInfo = null;
 
 function lookupBookings(){
   clientLookupPhone = document.getElementById('lookupPhone').value.trim();
@@ -1174,6 +1233,17 @@ function lookupBookings(){
   }
   clientLookupResults = appointments.filter(a => a.clientPhone === clientLookupPhone && a.date >= todayISO())
     .sort((a,b) => (a.date+a.time).localeCompare(b.date+b.time));
+  clientLookupCancelInfo = null;
+  getCancelLookupByPhone(clientLookupPhone.replace(/\D/g,'')).then(info => {
+    clientLookupCancelInfo = info;
+    render();
+  });
+  render();
+}
+
+function reopenCancelRequestFromLookup(){
+  if(!clientLookupCancelInfo) return;
+  cancelRequestPending = clientLookupCancelInfo;
   render();
 }
 
@@ -1193,7 +1263,9 @@ async function requestClientCancellation(id){
     createdAt: new Date().toISOString()
   };
   await addCancelRequestRecord(reqObj);
+  await upsertCancelLookup(appt.clientPhone.replace(/\D/g,''), reqObj);
   cancelRequestPending = reqObj;
+  clientLookupCancelInfo = reqObj;
   render();
 }
 
@@ -1210,10 +1282,11 @@ function renderCancelRequestScreen(){
   return `<div class="card">
       <p class="section-label">Pedido de cancelamento gerado</p>
       <p style="font-size:14px; line-height:1.6; color:var(--ink);">
-        Guarde este código e envie para o salão pelo WhatsApp. O cancelamento só é efetivado depois que a equipe confirmar.
+        Guarde este código e envie para o salão pelo WhatsApp, ou mostre o QR code na recepção. O cancelamento só é efetivado depois que a equipe confirmar.
       </p>
       <div class="stamp-wrap">
-        <p class="confirm-detail" style="font-size:28px; letter-spacing:0.08em;"><strong>${req.code}</strong></p>
+        <div class="qr-wrap">${renderQrSvg(req.code)}</div>
+        <p class="confirm-detail" style="font-size:28px; letter-spacing:0.08em; margin-top:10px;"><strong>${req.code}</strong></p>
       </div>
       <p style="font-size:13px; color:var(--ink-soft); margin-top:8px;">${escapeHtml(req.serviceName||'')} · ${displayDate(req.date)} às ${req.time}</p>
       ${waLink ? `<a href="${waLink}" target="_blank" rel="noopener" class="whatsapp-btn" style="display:block; text-align:center; margin-top:16px;">💬 Enviar código pelo WhatsApp</a>` : ''}
@@ -1221,24 +1294,52 @@ function renderCancelRequestScreen(){
     </div>`;
 }
 
+async function showCheckinCode(id){
+  const appt = appointments.find(a => a.id === id);
+  if(!appt) return;
+  if(!appt.checkinCode){
+    appt.checkinCode = String(Math.floor(100000 + Math.random()*900000));
+    await updateAppointmentRecord(appt);
+  }
+  clientCheckinAppt = appt;
+  render();
+}
+
+function renderCheckinScreen(){
+  const appt = clientCheckinAppt;
+  const d = fromISODate(appt.date);
+  return `<div class="card">
+      <p class="section-label">Confirmação de chegada</p>
+      <p style="font-size:14px; line-height:1.6; color:var(--ink);">
+        Mostre esse QR code ou informe o código na recepção quando chegar — isso confirma no sistema que o atendimento foi realizado.
+      </p>
+      <div class="stamp-wrap">
+        <div class="qr-wrap">${renderQrSvg(appt.checkinCode)}</div>
+        <p class="confirm-detail" style="font-size:28px; letter-spacing:0.08em; margin-top:10px;"><strong>${appt.checkinCode}</strong></p>
+      </div>
+      <p style="font-size:13px; color:var(--ink-soft); margin-top:8px;">${escapeHtml(appt.serviceName||'')}<br>${DOW_FULL[d.getDay()]}, ${displayDate(appt.date)} às ${appt.time}</p>
+      <button class="secondary" style="margin-top:14px;" onclick="clientCheckinAppt=null; render();">Fechar</button>
+    </div>`;
+}
+
 async function confirmCancelRequest(reqId){
   const req = cancelRequests.find(r => r.id === reqId);
   if(!req) return;
-  const typedEl = document.getElementById('cancelCode_'+reqId);
-  const typed = typedEl ? typedEl.value.trim() : '';
-  if(typed !== req.code){ flashMsg = 'Código incorreto.'; flashOk=false; render(); return; }
   localPendingDeletes.add(req.appointmentId);
   appointments = appointments.filter(a => a.id !== req.appointmentId);
   await deleteAppointmentRecord(req.appointmentId);
   cancelRequests = cancelRequests.filter(r => r.id !== reqId);
   await deleteCancelRequestRecord(reqId);
+  await deleteCancelLookup((req.clientPhone||'').replace(/\D/g,''));
   flashMsg = 'Cancelamento confirmado.'; flashOk = true;
   render();
 }
 
 async function rejectCancelRequest(reqId){
+  const req = cancelRequests.find(r => r.id === reqId);
   cancelRequests = cancelRequests.filter(r => r.id !== reqId);
   await deleteCancelRequestRecord(reqId);
+  if(req) await deleteCancelLookup((req.clientPhone||'').replace(/\D/g,''));
   render();
 }
 
@@ -1353,6 +1454,7 @@ async function cancelConfirmProceed(){
 function renderConfirmModal(){
   if(!pendingConfirm) return '';
   let message;
+  let nameHeading = '';
   if(pendingConfirm.type === 'client-delete'){
     const c = clients.find(cl => cl.id === pendingConfirm.id);
     const label = c ? c.name : 'este cliente';
@@ -1360,7 +1462,8 @@ function renderConfirmModal(){
   } else if(pendingConfirm.type === 'client'){
     const appt = appointments.find(a => a.id === pendingConfirm.id);
     const label = appt ? appt.clientName : 'este agendamento';
-    message = `Cancelar o agendamento de <strong>${escapeHtml(label)}</strong>? Vamos gerar um código que você precisa enviar pelo WhatsApp do salão — o cancelamento só é efetivado depois que a equipe confirmar.`;
+    nameHeading = `<p class="modal-name">Cancelar agendamento</p>`;
+    message = `Cancelar o agendamento de <strong>${escapeHtml(label)}</strong>? Vamos gerar um código (e QR code) que você precisa enviar pelo WhatsApp do salão ou mostrar na recepção — o cancelamento só é efetivado depois que a equipe confirmar.`;
   } else {
     const appt = appointments.find(a => a.id === pendingConfirm.id);
     const label = appt ? appt.clientName : 'este agendamento';
@@ -1368,6 +1471,7 @@ function renderConfirmModal(){
   }
   return `<div class="modal-overlay">
     <div class="modal-box">
+      ${nameHeading}
       <p class="modal-text">${message}</p>
       <div class="btn-row">
         <button class="secondary" style="flex:1;" onclick="cancelConfirmDismiss()">Voltar</button>
@@ -1647,20 +1751,41 @@ async function updateApptStatus(id, status){
   render();
 }
 
+function renderCheckinConfirmSection(){
+  return `<div class="card">
+    <p class="section-label">✅ Confirmar chegada por código</p>
+    <p class="footer-note" style="text-align:left;">Peça o código (ou QR) que o cliente mostra no celular ao chegar e digite aqui para marcar o atendimento como concluído automaticamente.</p>
+    <input type="text" id="checkinCodeInput" placeholder="000000" inputmode="numeric" maxlength="6">
+    <button class="primary" onclick="confirmCheckinByCode()">Confirmar chegada</button>
+  </div>`;
+}
+
+async function confirmCheckinByCode(){
+  const input = document.getElementById('checkinCodeInput');
+  const code = input ? input.value.trim() : '';
+  if(!code){ flashMsg = 'Digite o código.'; flashOk=false; render(); return; }
+  const appt = appointments.find(a => a.checkinCode === code);
+  if(!appt){ flashMsg = 'Código não encontrado. Confira com o cliente.'; flashOk=false; render(); return; }
+  if(appt.status === 'completed'){ flashMsg = 'Esse agendamento já estava marcado como concluído.'; flashOk=false; render(); return; }
+  appt.status = 'completed';
+  await updateAppointmentRecord(appt);
+  flashMsg = 'Chegada confirmada: '+appt.clientName+'.'; flashOk = true;
+  render();
+}
+
 function renderCancelRequestsSection(){
   if(cancelRequests.length === 0) return '';
   const sorted = [...cancelRequests].sort((a,b) => (a.createdAt||'').localeCompare(b.createdAt||''));
   let html = `<div class="card">
     <p class="section-label">⏳ Pedidos de cancelamento (${sorted.length})</p>
-    <p class="footer-note" style="text-align:left;">Peça o código pelo WhatsApp e confirme aqui antes de cancelar.</p>`;
+    <p class="footer-note" style="text-align:left;">O código já aparece aqui — confirme com o cliente e clique para efetivar.</p>`;
   sorted.forEach(r => {
     html += `<div class="svc-edit-form">
       <div style="font-size:13px; margin-bottom:8px;">
         <strong>${escapeHtml(r.clientName)}</strong> · ${escapeHtml(maskPhone(r.clientPhone))}<br>
         ${escapeHtml(r.serviceName||'')} · ${displayDate(r.date)} às ${r.time}
       </div>
-      <label class="field" style="margin-top:0;">Código informado pelo cliente</label>
-      <input type="text" id="cancelCode_${r.id}" placeholder="000000" inputmode="numeric" maxlength="6">
+      <div class="code-display">${r.code}</div>
       <div class="btn-row">
         <button class="secondary" style="flex:1;" onclick="rejectCancelRequest('${r.id}')">Recusar</button>
         <button class="primary" style="flex:1; margin-top:0; background:#8C2F2F;" onclick="confirmCancelRequest('${r.id}')">Confirmar cancelamento</button>
@@ -1709,7 +1834,8 @@ function renderAdminAgenda(){
 
   const svcFilterOptions = config.services.map(s => `<option value="${s.id}" ${adminAgendaServiceFilter===s.id?'selected':''}>${escapeHtml(s.name)}</option>`).join('');
 
-  let html = renderCancelRequestsSection();
+  let html = renderCheckinConfirmSection();
+  html += renderCancelRequestsSection();
   html += `<div class="card">
     <div class="filter-row">
       <button class="${adminAgendaFilter==='today'&&!adminAgendaCustomDate?'active':''}" onclick="setAgendaFilter('today')">Hoje</button>
